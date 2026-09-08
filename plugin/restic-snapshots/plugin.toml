@@ -1,0 +1,156 @@
+# Restic Snapshots — scheduled restic backups, a snapshot browser, staging restore, and
+# dry-run-gated retention.
+#
+# Execution model (verified in docs/phase0-findings.md):
+#   every restic invocation runs as a detached generated script writing
+#   <pluginDataDir>/jobs/<token>.jsonl + .exit. Detached runs are not subject to the
+#   runAsync timeout cap (50-60000ms), which a real backup would blow through.
+#   The password is passed with `--password-file <path>` — never as an env var or a value.
+
+id          = "carlocamacho/restic-snapshots"
+name        = "Restic Snapshots"
+icon        = "archive"
+version     = "0.1.0"
+plugin_api  = 24
+author      = "carlocamacho"
+license     = "MIT"
+dependencies = ["restic"]
+tags         = ["system", "backup", "panel", "service", "shortcut"]
+description  = "Scheduled restic backups with a snapshot browser, staging restore, and dry-run-gated retention."
+
+[[setting]]
+key             = "repository"
+type            = "string"
+label_key       = "settings.repository.label"
+description_key = "settings.repository.description"
+default         = ""
+
+[[setting]]
+key             = "password_file"
+type            = "file"
+label_key       = "settings.password_file.label"
+description_key = "settings.password_file.description"
+default         = ""
+
+[[setting]]
+key             = "backup_paths"
+type            = "string_list"
+label_key       = "settings.backup_paths.label"
+description_key = "settings.backup_paths.description"
+default         = []
+
+[[setting]]
+key             = "backup_tags"
+type            = "string_list"
+label_key       = "settings.backup_tags.label"
+description_key = "settings.backup_tags.description"
+default         = ["noctalia"]
+
+[[setting]]
+key             = "exclude_file"
+type            = "file"
+label_key       = "settings.exclude_file.label"
+description_key = "settings.exclude_file.description"
+default         = ""
+
+[[setting]]
+key             = "mode"
+type            = "select"
+label_key       = "settings.mode.label"
+description_key = "settings.mode.description"
+default         = "plugin"
+options = [
+  { value = "plugin",  label_key = "settings.mode.plugin" },
+  { value = "observe", label_key = "settings.mode.observe" },
+]
+
+[[setting]]
+key             = "interval_minutes"
+type            = "int"
+label_key       = "settings.interval_minutes.label"
+description_key = "settings.interval_minutes.description"
+default         = 60
+min             = 5
+max             = 1440
+
+[[setting]]
+key       = "keep_last"
+type      = "int"
+label_key = "settings.keep_last.label"
+default   = 7
+min       = 0
+max       = 365
+
+[[setting]]
+key       = "keep_daily"
+type      = "int"
+label_key = "settings.keep_daily.label"
+default   = 7
+min       = 0
+max       = 365
+
+[[setting]]
+key       = "keep_weekly"
+type      = "int"
+label_key = "settings.keep_weekly.label"
+default   = 4
+min       = 0
+max       = 104
+
+[[setting]]
+key       = "keep_monthly"
+type      = "int"
+label_key = "settings.keep_monthly.label"
+default   = 6
+min       = 0
+max       = 120
+
+[[setting]]
+key             = "restore_target"
+type            = "folder"
+label_key       = "settings.restore_target.label"
+description_key = "settings.restore_target.description"
+default         = "~/restore"
+
+[[setting]]
+key             = "check_subset"
+type            = "string"
+label_key       = "settings.check_subset.label"
+description_key = "settings.check_subset.description"
+default         = "1/100"
+advanced        = true
+
+[[setting]]
+key       = "restic_bin"
+type      = "string"
+label_key = "settings.restic_bin.label"
+default   = "restic"
+advanced  = true
+
+[[service]]
+id    = "service"
+entry = "service.luau"
+
+[[widget]]
+id    = "status"
+entry = "widget.luau"
+
+  [[widget.setting]]
+  key       = "show_count"
+  type      = "bool"
+  label_key = "settings.widget.show_count.label"
+  default   = false
+
+[[shortcut]]
+id    = "backup_now"
+entry = "shortcut.luau"
+
+[[panel]]
+id                       = "browser"
+entry                    = "panel.luau"
+width                    = 780
+height                   = 580
+placement                = "floating"
+position                 = "center"
+keyboard_focus           = "exclusive"
+dismiss_on_outside_click = true
