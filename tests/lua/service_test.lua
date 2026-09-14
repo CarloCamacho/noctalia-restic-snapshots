@@ -188,6 +188,15 @@ for key, value in pairs(H.config) do
   end
 end
 
+-- 0.3.0 settings the harness's canned config predates. H.install() does not reset H.config, so a
+-- case that sets one of these would otherwise leak it into every later boot(); seeding them here
+-- makes each case start from "unset" like the manifest's default.
+DEFAULTS.pre_backup_command = ""
+DEFAULTS.post_backup_command = ""
+DEFAULTS.metrics_dir = ""
+DEFAULTS.verify_interval_hours = 0
+DEFAULTS.verify_file_count = 3
+
 local runner = { pairs = {} }
 local snapshotJson = "[]"
 local snapshotExit = 0
@@ -362,6 +371,8 @@ local function lastJob()
           status = JOB_DIR .. "/" .. token .. ".status",
           exit = JOB_DIR .. "/" .. token .. ".exit",
           pid = JOB_DIR .. "/" .. token .. ".pid",
+          -- [0.3.0] where the script records its own pid; the service signals it first.
+          shpid = JOB_DIR .. "/" .. token .. ".shpid",
           script = cmd[2],
         }
       end
@@ -378,6 +389,40 @@ local function logCount(needle)
     end
   end
   return count
+end
+
+-- [0.3.0] Metrics export plumbing. The export is written to a temp file and renamed into place, so
+-- the write is what proves it ran; the content is read back from the harness's file map.
+local METRICS_DIR = "/tmp/noctalia-metrics"
+local PROM_PATH = METRICS_DIR .. "/restic_snapshots.prom"
+
+local function metricsWrites()
+  local count = 0
+  for _, call in ipairs(H.fsCalls) do
+    if call.name == "writeFile"
+        and tostring(call.path):find("restic_snapshots.prom", 1, true) ~= nil then
+      count = count + 1
+    end
+  end
+  return count
+end
+
+local function promText()
+  return H.files[PROM_PATH] or ""
+end
+
+-- Does the published job log carry a line containing `needle`?
+local function logHas(needle)
+  local joblog = H.published["restic_joblog"]
+  if joblog == nil or type(joblog.lines) ~= "table" then
+    return false
+  end
+  for _, line in ipairs(joblog.lines) do
+    if tostring(line):find(needle, 1, true) ~= nil then
+      return true
+    end
+  end
+  return false
 end
 
 local function scriptText()
@@ -579,6 +624,59 @@ do
     persisted ~= nil and persisted.lastRun ~= nil and persisted.lastRun.cancelled == true)
 end
 
+print("== cancel reaches the job script, not only restic")
+
+do
+  -- Both pids exist: restic is up and the script has recorded its own pid too.
+  boot({ interval_minutes = 5, job_timeout_minutes = 1 })
+  drain()
+  onIpc("backup-now")
+  local _, paths = lastJob()
+  H.files[paths.pid] = "9999\n"
+  H.files[paths.shpid] = "4242\n"
+
+  onIpc("cancel")
+  local sent = signals()
+  check("cancel signals the job script, not restic", #sent == 1 and sent[1] == "-TERM 4242",
+    table.concat(sent, ", "))
+
+  -- The watchdog's escalation has to reach the same process, or a job the script's trap missed
+  -- would be killable only in restic's name.
+  H.nowMs = (NOW_SEC + 61) * 1000
+  update()
+  H.nowMs = (NOW_SEC + 71) * 1000
+  update()
+  sent = signals()
+  check("the watchdog escalates to KILL on the script pid too",
+    #sent == 2 and sent[2] == "-KILL 4242", table.concat(sent, ", "))
+  exitJob('{"message_type":"summary"}\n', 143)
+end
+
+do
+  -- The hole itself: a pre-command is running, so restic has not started and there is no restic
+  -- pid file at all. Before 0.3.0 cancel did nothing here, and a watchdog strike released the
+  -- single-flight guard while the script - and its hook - kept running.
+  boot({ interval_minutes = 5, job_timeout_minutes = 180, pre_backup_command = "sleep 60" })
+  drain()
+  onIpc("backup-now")
+  local _, paths = lastJob()
+  H.files[paths.pid] = nil
+  H.files[paths.shpid] = "4242\n"
+
+  onIpc("cancel")
+  local sent = signals()
+  check("cancel reaches a job whose pre-command is still running",
+    #sent == 1 and sent[1] == "-TERM 4242", table.concat(sent, ", "))
+  check("the script's trap is the only pid a hook job has recorded",
+    H.files[paths.pid] == nil and H.files[paths.shpid] == "4242\n")
+
+  -- What the trap leaves behind: the job ends with 143 and the service records a cancel.
+  exitJob("== pre-backup command ==\n", 143)
+  check("the cancelled hook job is recorded as cancelled", status().lastRun.cancelled == true)
+  check("the cancelled hook job is not a restic failure", status().error == "", status().error)
+  check("the cancelled hook job releases the guard", status().busy == false)
+end
+
 print("== failure visibility")
 
 do
@@ -621,6 +719,196 @@ do
     return joblog.lines ~= nil and #joblog.lines == 1 and joblog.truncated == false
   end)())
   check("a successful run refreshes the snapshots", argvCalls("snapshots") >= 2)
+end
+
+print("== pre/post-backup hooks reach the backup path and nothing else")
+
+do
+  boot({
+    interval_minutes = 1440,
+    check_interval_hours = 1,
+    pre_backup_command = "dump --to /tmp/stage",
+    post_backup_command = "sync --done",
+  })
+  drain()
+
+  onIpc("backup-now")
+  local backup = scriptText()
+  check("a configured pre-command reaches the generated script",
+    backup:find("PRECOMMAND='dump --to /tmp/stage'", 1, true) ~= nil,
+    backup:sub(1, 200))
+  check("a configured post-command reaches the generated script",
+    backup:find("POSTCOMMAND='sync --done'", 1, true) ~= nil)
+  check("the pre-command is invoked before restic and the post-command after it",
+    (backup:find("sh -c \"$PRECOMMAND\"", 1, true) or 0) < (backup:find("'backup'", 1, true) or 0)
+      and (backup:find("sh -c \"$POSTCOMMAND\"", 1, true) or 0) > (backup:find("'backup'", 1, true) or 0))
+  exitJob('{"message_type":"summary","total_files_processed":1}\n', 0)
+
+  -- The settings are named pre/post-*backup*: no other job kind may run them.
+  onIpc("check")
+  local checkScript = scriptText()
+  check("a check job's script carries no pre-command",
+    checkScript:find("PRECOMMAND", 1, true) == nil, checkScript:sub(1, 200))
+  check("a check job's script carries no post-command",
+    checkScript:find("POSTCOMMAND", 1, true) == nil)
+  check("a check job's script has no hook invocation at all",
+    checkScript:find("/bin/sh -c", 1, true) == nil)
+  exitJob('{"message_type":"summary","num_errors":0}\n', 0)
+
+  -- A restore must not run them either - the settings belong to the backup.
+  onIpc("restore-dry-run", '{"snapshot":"abcdef12"}')
+  check("a restore job's script carries no hooks",
+    scriptText():find("PRECOMMAND", 1, true) == nil
+      and scriptText():find("POSTCOMMAND", 1, true) == nil)
+  exitJob('{"message_type":"summary","total_files":1,"files_restored":1}\n', 0)
+
+  -- The defaults: an empty setting is no hook, so a hook-free job is generated exactly as before.
+  boot({ interval_minutes = 1440, pre_backup_command = "", post_backup_command = "" })
+  drain()
+  onIpc("backup-now")
+  check("an empty pre-command setting generates no hook",
+    scriptText():find("PRECOMMAND", 1, true) == nil
+      and scriptText():find("PRE_", 1, true) == nil)
+  check("an empty post-command setting generates no hook",
+    scriptText():find("POSTCOMMAND", 1, true) == nil)
+  check("the hook-free script still has the cancellation machinery",
+    scriptText():find('> "$shpidfile"', 1, true) ~= nil
+      and scriptText():find(" TERM INT HUP", 1, true) ~= nil)
+  exitJob('{"message_type":"summary","total_files_processed":1}\n', 0)
+end
+
+print("== a failing pre-command is reported honestly")
+
+do
+  boot({ interval_minutes = 1440, pre_backup_command = "exit 3" })
+  drain()
+  onIpc("backup-now")
+  check("a backup with a pre-command is started", jobStarts() == 1, jobStarts())
+  -- Exactly what the runner writes when the pre-command aborts the job: the marker, the hook's own
+  -- output, and the runner's line saying restic was never started. The exit code is the hook's.
+  exitJob("== pre-backup command ==\nboom: the staging dump failed\n"
+    .. "the pre-backup command failed; restic was not started\n", 3)
+
+  local published = status()
+  check("a failing pre-command is not a success", published.lastRun.ok == false)
+  check("a failing pre-command is not a cancellation", published.lastRun.cancelled ~= true)
+  check("the recorded exit code is the hook's", published.lastRun.exitCode == 3,
+    tostring(published.lastRun.exitCode))
+  check("the error does not claim restic failed",
+    published.error:find("restic was not started", 1, true) ~= nil
+      and published.error:find("backup failed", 1, true) == nil, published.error)
+  check("a failing pre-command is not announced as a restic failure",
+    logCount("error: Restic backup failed") == 0, logCount("error: Restic backup failed"))
+  check("a failing pre-command is announced for what it is",
+    logCount("error: Restic pre-backup command failed") == 1,
+    logCount("error: Restic pre-backup command failed"))
+  local joblog = H.published["restic_joblog"]
+  check("the job log is published as failed",
+    joblog ~= nil and joblog.ok == false and joblog.exitCode == 3,
+    joblog and tostring(joblog.ok))
+  check("the published log shows the pre-command marker", logHas("== pre-backup command =="))
+  check("the published log shows the hook's own output", logHas("boom: the staging dump failed"))
+  check("the published log says restic was never started", logHas("restic was not started"))
+  check("the run is persisted as failed", readState().lastRun.ok == false)
+  check("a failing pre-command does not record a success", published.lastSuccessAt == nil,
+    tostring(published.lastSuccessAt))
+  check("a failing pre-command releases the guard", published.busy == false)
+end
+
+print("== metrics export")
+
+do
+  -- The feature unset: nothing under the metrics path is written or even looked at.
+  boot({ interval_minutes = 1440, metrics_dir = "" })
+  drain()
+  onIpc("backup-now")
+  exitJob('{"message_type":"summary","total_files_processed":1}\n', 0)
+  check("with no metrics directory nothing is written", H.files[PROM_PATH] == nil)
+  check("with no metrics directory no write is attempted", metricsWrites() == 0, metricsWrites())
+end
+
+do
+  -- Configured: the config load itself is a transition, and a job finish is another.
+  boot({ interval_minutes = 1440, metrics_dir = METRICS_DIR })
+  drain()
+  check("loading the config writes the export", metricsWrites() >= 1 and H.files[PROM_PATH] ~= nil,
+    metricsWrites())
+
+  onIpc("backup-now")
+  local before = metricsWrites()
+  exitJob('{"message_type":"summary","total_files_processed":4,"total_bytes_processed":2048,'
+    .. '"data_added":512}\n', 0)
+  drain()
+  check("a finished job rewrites the export", metricsWrites() > before,
+    metricsWrites() .. " vs " .. before)
+
+  local text = promText()
+  check("the export records the last job's kind and exit code",
+    text:find('restic_snapshots_last_job_exit_code{kind="backup"} 0', 1, true) ~= nil, text)
+  check("the export records when the backup succeeded",
+    text:find("restic_snapshots_last_success_timestamp_seconds " .. tostring(NOW_SEC), 1, true) ~= nil,
+    text)
+  check("the export carries the repository's snapshot count",
+    text:find("restic_snapshots_count ", 1, true) ~= nil, text)
+  check("the export dates itself", text:find("restic_snapshots_export_timestamp_seconds", 1, true) ~= nil)
+  check("the export is published atomically", (function()
+    for _, call in ipairs(H.fsCalls) do
+      if call.name == "renameFile" and tostring(call.to) == PROM_PATH then
+        return true
+      end
+    end
+    return false
+  end)())
+
+  -- The tick is not a transition. A write from update() would re-stamp the file every couple of
+  -- seconds and make the export's own timestamp meaningless.
+  local afterJob = metricsWrites()
+  H.nowMs = (NOW_SEC + 120) * 1000
+  update()
+  update()
+  drain()
+  check("the update tick never rewrites the export", metricsWrites() == afterJob, metricsWrites())
+
+  -- A refresh is a transition, and so is a verification attempt.
+  H.nowMs = (NOW_SEC + 130) * 1000
+  onIpc("refresh")
+  drain()
+  check("a snapshot refresh rewrites the export", metricsWrites() > afterJob, metricsWrites())
+end
+
+do
+  -- A failing write: one log line per failure streak, and never a mark on the job that caused it.
+  boot({ interval_minutes = 1440, metrics_dir = METRICS_DIR })
+  drain()
+  onIpc("backup-now")
+  -- From here every filesystem write fails - the generated script is already on disk, so only the
+  -- export and the state file are affected.
+  H.failCalls.writeFile = true
+  exitJob('{"message_type":"summary","total_files_processed":2}\n', 0)
+  drain()
+  check("a failing export is logged once", logCount("restic: metrics export failed") == 1,
+    logCount("restic: metrics export failed"))
+  check("a failing export does not change the job's result", status().lastRun.ok == true,
+    tostring(status().lastRun.ok))
+  check("a failing export does not set status.error", status().error == "", status().error)
+
+  H.nowMs = (NOW_SEC + 60) * 1000
+  onIpc("refresh")
+  drain()
+  onIpc("refresh")
+  drain()
+  check("further failed exports do not fill the log",
+    logCount("restic: metrics export failed") == 1, logCount("restic: metrics export failed"))
+
+  -- A successful write re-arms the line, so a later failure is still visible.
+  H.failCalls.writeFile = false
+  onIpc("refresh")
+  drain()
+  H.failCalls.writeFile = true
+  onIpc("refresh")
+  drain()
+  check("a failure after a recovery is logged again",
+    logCount("restic: metrics export failed") == 2, logCount("restic: metrics export failed"))
 end
 
 print("== staleness guardian (observe mode)")

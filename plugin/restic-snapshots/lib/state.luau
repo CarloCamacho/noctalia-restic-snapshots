@@ -35,7 +35,8 @@ M.EVENT_LS = "ls"                         -- { snapshot }
 M.EVENT_DIFF = "diff"                     -- { from, to }
 M.EVENT_INIT = "init"
 M.EVENT_UNLOCK = "unlock"
-M.EVENT_LOGS = "job-log"                  -- { kind? } -- re-publish the last job's log
+M.EVENT_LOGS = "job-log"
+M.EVENT_VERIFY = "verify-restore"       -- { target? } -- restore a sample and compare it                  -- { kind? } -- re-publish the last job's log
 
 -- ── the status shape ─────────────────────────────────────────────────────────
 -- Written by the service (publish()), read by the panel, the widget and the shortcut tile.
@@ -62,6 +63,7 @@ function M.emptyStatus()
     staleness = nil,          -- hours since the newest snapshot; nil until known
     stale = false,            -- staleness passed the configured threshold
     checks = nil,             -- { lastAt, lastOk, numErrors }
+    verify = nil,             -- { lastAt, lastOk, checked, matched, failed, detail }
     initNeeded = false,       -- repository reachable but not initialised yet
     error = "",               -- last failure message shown in the panel/widget
   }

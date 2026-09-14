@@ -5,33 +5,46 @@ script, writes it to disk and runs it through /bin/sh with a fake `restic`, so t
 the stdout/stderr split, the recorded pid, the exit-code file and the argument quoting are
 exercised by a real shell. That is the only way to prove the generated script actually works.
 
+The 0.3.0 pre/post-backup hooks are verified the same way, because ordering, exit codes and the log
+markers are things only a real shell can settle: the pre-command must run before restic, a failing
+one must abort before restic, the post-command must see restic's code in RESTIC_EXIT, and its own
+failure must not become the job's recorded result.
+
 Skipped when lua5.4 (used to drive the generator through the shared harness) is unavailable.
 """
 
 import glob
 import os
+import re
 import shutil
+import signal
 import stat
 import subprocess
 import tempfile
 import textwrap
+import time
 import unittest
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PLUGIN_DIR = "plugin/restic-snapshots"
 LUA = shutil.which("lua5.4") or shutil.which("lua")
 
+# The 0.3.0 freeze commit ("chore(0.3.0): freeze the feature contracts"). Its lib/jobs.luau is the
+# 0.2.0 generator, which is what contract 5.3 demands a hook-free job still be byte-identical to.
+BASE_REV = "c03eced"
+
 # Drives the plugin's own generator through tests/lua/harness.lua and drops the script it writes
 # onto the real filesystem (the harness only keeps it in memory). Args: dataDir resticPath
-# hostileArg envFile.
+# hostileArg envFile preCommand postCommand pluginDir ("" = that option is unset).
 GENERATOR_LUA = textwrap.dedent(
     """
     package.path = "tests/lua/?.lua;" .. package.path
     local H = dofile("tests/lua/harness.lua")
-    H.install("plugin/restic-snapshots")
+
+    local dataDir, resticPath, hostile, envFile, preCommand, postCommand, pluginDir = ...
+    H.install((pluginDir ~= nil and pluginDir ~= "") and pluginDir or "plugin/restic-snapshots")
     local jobs = H.load("lib/jobs.luau")
 
-    local dataDir, resticPath, hostile, envFile = ...
     _G.noctalia.pluginDataDir = function() return dataDir end
 
     local argv = {
@@ -41,6 +54,8 @@ GENERATOR_LUA = textwrap.dedent(
     local token, err, paths = jobs.start(argv, {
       pathPrefix = "/usr/bin:/bin",
       envFile = (envFile ~= "" and envFile or nil),
+      preCommand = (preCommand ~= "" and preCommand or nil),
+      postCommand = (postCommand ~= "" and postCommand or nil),
     })
     assert(token ~= nil, tostring(err))
 
@@ -52,9 +67,11 @@ GENERATOR_LUA = textwrap.dedent(
     """
 )
 
-# A fake restic: records its own pid, its argv ($0 included), and the fifo's mode, then emits two
-# status lines on stdout, one noise line on stderr, an env probe, and a summary line.
+# A fake restic: records that it started (before anything else, so the ordering of a pre-command
+# against it is observable), its own pid, its argv ($0 included), and the fifo's mode, then emits
+# two status lines on stdout, one noise line on stderr, an env probe, and a summary line.
 FAKE_RESTIC = """#!/bin/sh
+printf '%s\\n' restic >> "$FAKE_ORDER_FILE"
 printf '%s' "$$" > "$FAKE_PID_FILE"
 printf '%s\\n' "$0" "$@" > "$FAKE_ARGV_FILE"
 sleep 0.3
@@ -72,23 +89,84 @@ exit "${FAKE_EXIT_CODE:-0}"
 
 STATUS_FIRST = '{"message_type":"status","percent_done":0.5,"files_done":5,"total_files":10}'
 STATUS_LAST = '{"message_type":"status","percent_done":1.0,"files_done":10,"total_files":10}'
+
+# [0.3.0] A restic that refuses to die on SIGTERM - what a stuck upload looks like - and keeps
+# writing status lines. Cancelling a job whose restic is the running child is the common case, and
+# the script's trap has to run even though the shell is blocked reading the fifo at the time.
+FAKE_RESTIC_SLOW = """#!/bin/sh
+printf '%s\\n' restic >> "$FAKE_ORDER_FILE"
+printf '%s' "$$" > "$FAKE_PID_FILE"
+trap '' TERM
+i=0
+while [ $i -lt 240 ]; do
+  printf '%s\\n' '{"message_type":"status","percent_done":0.2,"files_done":2,"total_files":10}'
+  sleep 0.5
+  i=$((i+1))
+done
+printf '%s\\n' '{"message_type":"summary","total_files_processed":10}'
+"""
 SUMMARY = '{"message_type":"summary","total_files_processed":10,"total_bytes_processed":2048,"data_added":512}'
 NOISE = "restic: plain noise on stderr"
 HOSTILE = "/tmp/it's a $(dangerous) `command` path && echo pwned"
+
+PRE_MARKER = "== pre-backup command =="
+POST_MARKER = "== post-backup command =="
+
+# [0.3.0] Cancellation. Each hook records its own pid and then becomes a single long-lived process,
+# so a TERM to the script can be aimed at a job that is running neither restic nor anything that
+# would finish on its own. `exec` keeps the hook one process, which is what the trap is contracted
+# to kill (the recorded pid is the process the script backgrounded).
+PRE_SLEEPS = 'echo pre-running; echo $$ > "$FAKE_HOOK_PID_FILE"; exec sleep 30'
+POST_SLEEPS = 'echo post-running; echo $$ > "$FAKE_HOOK_PID_FILE"; exec sleep 30'
+
+# Hook commands. They are user-supplied shell strings, so they carry shell metacharacters on
+# purpose - including a `$VAR` only the job script's environment can expand.
+PRE_ORDER = 'echo pre; echo pre >> "$FAKE_ORDER_FILE"'
+POST_ORDER = 'echo post; echo post >> "$FAKE_ORDER_FILE"'
+PRE_FAILS = 'echo pre-boom; echo pre >> "$FAKE_ORDER_FILE"; exit 3'
+POST_BOOM = "echo post-boom; exit 9"
+POST_REPORTS_EXIT = 'echo "restic-exit:$RESTIC_EXIT"'
+HOSTILE_PRE = 'echo "cmd:<it\'s a $(echo SUB) value>"'
 
 
 def mode_of(path):
     return stat.S_IMODE(os.stat(path).st_mode)
 
 
-class JobScriptTest(unittest.TestCase):
+def read_text(path):
+    with open(path, "r") as handle:
+        return handle.read()
+
+
+def maybe_text(path):
+    return read_text(path) if path and os.path.exists(path) else None
+
+
+def live_pid(pid):
+    """The pid if that process still exists, else None."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return None
+    except PermissionError:
+        return pid
+    return pid
+
+
+class JobScriptHarness(unittest.TestCase):
+    """Shared generator/runner plumbing. No tests of its own."""
+
     @classmethod
     def setUpClass(cls):
         if LUA is None:
             raise unittest.SkipTest("lua5.4 is not available to drive the generator")
 
-    def run_job(self, exit_code=0, with_env_file=True):
-        """Generate a script with the plugin's generator, run it, return everything it wrote."""
+    def prepare(self, exit_code=0, with_env_file=True, pre="", post="", plugin_dir="", restic=FAKE_RESTIC):
+        """Generate a job script with the plugin's own generator and lay out a place to run it.
+
+        Split out of run_job so the cancellation tests can launch the same script in the
+        background, signal it, and then read back exactly what the synchronous path reads.
+        """
         tmp = tempfile.mkdtemp(prefix="jobs-script-")
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
 
@@ -100,7 +178,7 @@ class JobScriptTest(unittest.TestCase):
 
         restic_path = os.path.join(bin_dir, "restic")
         with open(restic_path, "w") as handle:
-            handle.write(FAKE_RESTIC)
+            handle.write(restic)
         os.chmod(restic_path, 0o755)
 
         # A path with a quote in it, to prove the sourcing line is quoted properly too.
@@ -115,19 +193,35 @@ class JobScriptTest(unittest.TestCase):
         pid_file = os.path.join(tmp, "fake.pid")
         argv_file = os.path.join(tmp, "fake.argv")
         mode_file = os.path.join(tmp, "fake.mode")
+        order_file = os.path.join(tmp, "fake.order")
+        # A hook command can record its own pid here: the cancellation tests need to know which
+        # process the script's trap was supposed to reach.
+        hook_pid_file = os.path.join(tmp, "fake.hookpid")
         env = dict(os.environ)
         env.update(
             {
                 "FAKE_PID_FILE": pid_file,
                 "FAKE_ARGV_FILE": argv_file,
                 "FAKE_MODE_FILE": mode_file,
+                "FAKE_ORDER_FILE": order_file,
+                "FAKE_HOOK_PID_FILE": hook_pid_file,
                 "FAKE_JOBS_DIR": jobs_dir,
                 "FAKE_EXIT_CODE": str(exit_code),
             }
         )
 
         generated = subprocess.run(
-            [LUA, driver, data_dir, restic_path, HOSTILE, env_file if with_env_file else ""],
+            [
+                LUA,
+                driver,
+                data_dir,
+                restic_path,
+                HOSTILE,
+                env_file if with_env_file else "",
+                pre,
+                post,
+                plugin_dir,
+            ],
             cwd=REPO_ROOT,
             env=env,
             capture_output=True,
@@ -138,43 +232,82 @@ class JobScriptTest(unittest.TestCase):
 
         scripts = glob.glob(os.path.join(jobs_dir, "*.sh"))
         self.assertEqual(len(scripts), 1, "expected exactly one generated script")
-        script_path = scripts[0]
-
-        # Production launches the script through /bin/sh with the script path as $0.
-        run = subprocess.run(["/bin/sh", script_path], cwd=tmp, env=env, capture_output=True, text=True, timeout=60)
-
-        def read(path):
-            with open(path, "r") as handle:
-                return handle.read()
-
-        def maybe_read(path):
-            return read(path) if os.path.exists(path) else None
-
-        log_path = glob.glob(os.path.join(jobs_dir, "*.jsonl"))
-        status_path = glob.glob(os.path.join(jobs_dir, "*.status"))
         return {
             "tmp": tmp,
-            "script": script_path,
-            "script_text": read(script_path),
-            "returncode": run.returncode,
-            "log": read(log_path[0]) if log_path else "",
-            "status": maybe_read(status_path[0]) if status_path else None,
-            "status_path": status_path[0] if status_path else None,
-            "exit": maybe_read(os.path.join(glob.glob(os.path.join(jobs_dir, "*.exit"))[0]))
-            if glob.glob(os.path.join(jobs_dir, "*.exit"))
-            else None,
-            "pid": maybe_read(os.path.join(glob.glob(os.path.join(jobs_dir, "*.pid"))[0]))
-            if glob.glob(os.path.join(jobs_dir, "*.pid"))
-            else None,
-            "jobs_dir": jobs_dir,
-            "fifos_left": glob.glob(os.path.join(jobs_dir, "*.fifo")),
-            "fake_pid": maybe_read(pid_file),
-            "fake_argv": read(argv_file).splitlines() if os.path.exists(argv_file) else [],
-            "fifo_modes": read(mode_file).splitlines() if os.path.exists(mode_file) else [],
-            "restic_path": restic_path,
             "data_dir": data_dir,
+            "jobs_dir": jobs_dir,
+            "script": scripts[0],
+            "env": env,
+            "env_file": env_file,
+            "restic_path": restic_path,
+            "pid_file": pid_file,
+            "argv_file": argv_file,
+            "mode_file": mode_file,
+            "order_file": order_file,
+            "hook_pid_file": hook_pid_file,
         }
 
+    def read_outputs(self, ctx, returncode):
+        """Everything the job wrote, read from the context prepare() laid out."""
+        jobs_dir = ctx["jobs_dir"]
+        log_path = glob.glob(os.path.join(jobs_dir, "*.jsonl"))
+        status_path = glob.glob(os.path.join(jobs_dir, "*.status"))
+        exits = glob.glob(os.path.join(jobs_dir, "*.exit"))
+        pids = glob.glob(os.path.join(jobs_dir, "*.pid"))
+        shpids = glob.glob(os.path.join(jobs_dir, "*.shpid"))
+        leftovers = glob.glob(os.path.join(jobs_dir, "*.fifo"))
+        return {
+            "tmp": ctx["tmp"],
+            "script": ctx["script"],
+            "script_text": read_text(ctx["script"]),
+            "returncode": returncode,
+            "log": read_text(log_path[0]) if log_path else "",
+            "status": maybe_text(status_path[0]) if status_path else None,
+            "status_path": status_path[0] if status_path else None,
+            "exit": maybe_text(exits[0]) if exits else None,
+            "pid": maybe_text(pids[0]) if pids else None,
+            "shpid": maybe_text(shpids[0]) if shpids else None,
+            "shpid_path": shpids[0] if shpids else None,
+            "jobs_dir": jobs_dir,
+            "fifos_left": leftovers,
+            "fake_pid": maybe_text(ctx["pid_file"]),
+            "fake_argv": read_text(ctx["argv_file"]).splitlines()
+            if os.path.exists(ctx["argv_file"])
+            else [],
+            "fifo_modes": read_text(ctx["mode_file"]).splitlines()
+            if os.path.exists(ctx["mode_file"])
+            else [],
+            "order": read_text(ctx["order_file"]).splitlines()
+            if os.path.exists(ctx["order_file"])
+            else [],
+            "hook_pid": maybe_text(ctx["hook_pid_file"]),
+            "restic_path": ctx["restic_path"],
+            "data_dir": ctx["data_dir"],
+        }
+
+    def run_job(self, exit_code=0, with_env_file=True, pre="", post="", plugin_dir=""):
+        """Generate a script with the plugin's generator, run it, return everything it wrote."""
+        ctx = self.prepare(
+            exit_code=exit_code, with_env_file=with_env_file, pre=pre, post=post, plugin_dir=plugin_dir
+        )
+        # Production launches the script through /bin/sh with the script path as $0.
+        run = subprocess.run(
+            ["/bin/sh", ctx["script"]], cwd=ctx["tmp"], env=ctx["env"],
+            capture_output=True, text=True, timeout=60,
+        )
+        return self.read_outputs(ctx, run.returncode)
+
+    def wait_for(self, predicate, timeout=10.0):
+        """Poll until the predicate holds (or the timeout runs out). Returns its last value."""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.05)
+        return bool(predicate())
+
+
+class JobScriptTest(JobScriptHarness):
     def test_shell_run_splits_output_records_restics_pid_and_exit_code(self):
         result = self.run_job(exit_code=7, with_env_file=True)
         log_lines = result["log"].splitlines()
@@ -242,6 +375,307 @@ class JobScriptTest(unittest.TestCase):
         self.assertEqual(result["status"].strip(), STATUS_LAST)
         self.assertEqual(result["pid"].strip(), result["fake_pid"].strip())
         self.assertEqual(result["exit"].strip(), "0")
+
+
+class JobScriptHooksTest(JobScriptHarness):
+    """0.3.0 pre/post-backup hooks, run by a real /bin/sh against the fake restic."""
+
+    # [0.3.0] The lines every job script carries for cancellation, immediately after `umask 077`:
+    # the script's own pid, and the trap that kills whichever child is running (restic, or a hook).
+    CANCELLATION_LINE_PATTERNS = [
+        r"^shpidfile='.*\.shpid'$",
+        r'^printf \'%s\' "\$\$" > "\$shpidfile"$',
+        r"^child=$",
+        r"^trap '.*' TERM INT HUP$",
+    ]
+
+    def test_hooks_run_around_restic_and_mark_the_log(self):
+        result = self.run_job(exit_code=0, pre=PRE_ORDER, post=POST_ORDER)
+        log_lines = result["log"].splitlines()
+
+        # The order file is written by the fake restic and by both hook commands: whatever
+        # sequential order it holds is the order the shell really executed them in.
+        self.assertEqual(
+            result["order"], ["pre", "restic", "post"],
+            "the pre-command must finish before restic starts, the post-command after it",
+        )
+
+        # Both marker lines are in the job log, each immediately before its own command's output.
+        self.assertIn(PRE_MARKER, log_lines)
+        self.assertIn(POST_MARKER, log_lines)
+        self.assertLess(log_lines.index(PRE_MARKER), log_lines.index("pre"))
+        self.assertLess(log_lines.index("pre"), log_lines.index(SUMMARY))
+        self.assertLess(log_lines.index(SUMMARY), log_lines.index(POST_MARKER))
+        self.assertLess(log_lines.index(POST_MARKER), log_lines.index("post"))
+
+        # Hooks change nothing about the rest of the job.
+        self.assertEqual(result["returncode"], 0)
+        self.assertEqual(result["exit"].strip(), "0")
+        self.assertEqual(result["pid"].strip(), result["fake_pid"].strip())
+        self.assertEqual(result["status"].strip(), STATUS_LAST)
+        self.assertEqual(result["fifos_left"], [])
+
+    def test_a_failing_pre_command_aborts_before_restic(self):
+        result = self.run_job(exit_code=0, pre=PRE_FAILS)
+        log_lines = result["log"].splitlines()
+
+        # restic was never started: it did not append to the order file, wrote neither pid nor argv.
+        self.assertEqual(result["order"], ["pre"], "restic must not have run")
+        self.assertIsNone(result["fake_pid"], "the fake restic must never have started")
+        self.assertEqual(result["fake_argv"], [])
+        self.assertNotIn(SUMMARY, log_lines)
+
+        # The pre-command's own status is the job's result, in the file and as the script's code.
+        self.assertEqual(result["exit"].strip(), "3")
+        self.assertEqual(result["returncode"], 3, "the script must exit with the pre-command's code")
+
+        # Its output is still in the log, behind the marker, and the fifo is cleaned up.
+        self.assertIn(PRE_MARKER, log_lines)
+        self.assertIn("pre-boom", log_lines)
+        self.assertNotIn(POST_MARKER, log_lines)
+        self.assertEqual(result["fifos_left"], [])
+
+    def test_the_post_command_receives_restics_exit_code(self):
+        result = self.run_job(exit_code=5, post=POST_REPORTS_EXIT)
+        log_lines = result["log"].splitlines()
+
+        self.assertIn("restic-exit:5", log_lines, "the post-command never saw RESTIC_EXIT")
+        # A successful post-command leaves the backup's code alone.
+        self.assertEqual(result["exit"].strip(), "5")
+        self.assertIn(POST_MARKER, log_lines)
+
+    def test_a_failing_post_command_keeps_restics_exit_code(self):
+        result = self.run_job(exit_code=4, post=POST_BOOM)
+        log_lines = result["log"].splitlines()
+
+        self.assertIn("post-boom", log_lines, "the post-command never ran")
+        self.assertEqual(result["exit"].strip(), "4", "the recorded result is restic's")
+        self.assertEqual(result["returncode"], 0, "the wrapper script itself still exits 0")
+        self.assertEqual(result["order"], ["restic"])
+
+    def test_the_post_command_runs_after_a_failed_backup(self):
+        result = self.run_job(exit_code=6, post=POST_REPORTS_EXIT, pre=PRE_ORDER)
+        log_lines = result["log"].splitlines()
+
+        self.assertEqual(result["order"], ["pre", "restic"])
+        self.assertIn("restic-exit:6", log_lines)
+        self.assertEqual(result["exit"].strip(), "6")
+
+    def test_a_hostile_command_value_round_trips_through_the_shell(self):
+        # The value contains a single quote and a `$(...)`: if it were not written as one quoted
+        # word, the script would either fail to parse or run the substitution itself.
+        result = self.run_job(exit_code=0, pre=HOSTILE_PRE, post=POST_ORDER)
+        log_lines = result["log"].splitlines()
+
+        self.assertIn("cmd:<it's a SUB value>", log_lines)
+        self.assertEqual(result["order"], ["restic", "post"], "the pre-command never completed")
+        self.assertEqual(result["exit"].strip(), "0")
+
+    def test_without_hooks_the_script_has_no_trace_of_them(self):
+        result = self.run_job(exit_code=0)
+        log_lines = result["log"].splitlines()
+
+        for marker in (PRE_MARKER, POST_MARKER):
+            self.assertNotIn(marker, log_lines)
+            self.assertNotIn(marker, result["script_text"])
+        for artefact in ("/bin/sh -c", "PRECOMMAND", "POSTCOMMAND", "RESTIC_EXIT", "prestatus"):
+            self.assertNotIn(artefact, result["script_text"])
+
+        # The job itself is unchanged, and the hooks would have shown up in the order file.
+        self.assertEqual(result["order"], ["restic"])
+        self.assertEqual(result["exit"].strip(), "0")
+        self.assertEqual(result["status"].strip(), STATUS_LAST)
+
+    def test_hook_free_script_is_byte_identical_to_the_pre_hooks_generator(self):
+        """Contract 5.3: with neither option set the script carries no hook code.
+
+        [0.3.0] It is no longer byte-identical to the pre-hooks generator, because cancellation now
+        needs the script's own pid and a trap in *every* job - hook-free jobs included. The
+        guarantee is kept, and sharpened: the only difference is those lines, in a known place, and
+        nothing else in the script may move.
+        """
+        baseline = subprocess.run(
+            ["git", "-C", REPO_ROOT, "show", BASE_REV + ":" + PLUGIN_DIR + "/lib/jobs.luau"],
+            capture_output=True,
+            text=True,
+        )
+        if baseline.returncode != 0:
+            self.skipTest("the pre-hooks generator (%s) is not in this checkout" % BASE_REV)
+
+        tmp = tempfile.mkdtemp(prefix="jobs-baseline-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        base_plugin = os.path.join(tmp, PLUGIN_DIR.replace("/", "_"))
+        shutil.copytree(os.path.join(REPO_ROOT, PLUGIN_DIR), base_plugin)
+        with open(os.path.join(base_plugin, "lib", "jobs.luau"), "w") as handle:
+            handle.write(baseline.stdout)
+
+        old = self.run_job(exit_code=0, plugin_dir=base_plugin)
+        new = self.run_job(exit_code=0)
+
+        # Only the per-run tmp directory (which the job token lives under) may differ - and the
+        # token itself, which is random per generator process.
+        def normalized(result):
+            text = result["script_text"].replace(result["tmp"], "<TMP>")
+            return re.sub(r"jobs/[0-9a-f]+\.", "jobs/<TOKEN>.", text).splitlines()
+
+        old_lines = normalized(old)
+        new_lines = normalized(new)
+        added = len(self.CANCELLATION_LINE_PATTERNS)
+        self.assertEqual(
+            len(new_lines), len(old_lines) + added,
+            "the cancellation lines are the only new lines",
+        )
+        anchor = old_lines.index("umask 077") + 1
+        self.assertEqual(new_lines[:anchor], old_lines[:anchor], "nothing before the umask moved")
+        self.assertEqual(new_lines[anchor + added:], old_lines[anchor:], "nothing after them moved")
+        for line, pattern in zip(new_lines[anchor:anchor + added], self.CANCELLATION_LINE_PATTERNS):
+            self.assertRegex(line, pattern)
+        # And no hook machinery came along with them.
+        for artefact in ("PRECOMMAND", "POSTCOMMAND", "RESTIC_EXIT", "/bin/sh -c"):
+            self.assertNotIn(artefact, new["script_text"])
+
+
+class JobScriptCancellationTest(JobScriptHarness):
+    """[0.3.0] Cancellation reaches the whole job, not only restic.
+
+    Real /bin/sh, real signals, a real sleeping hook: a job is launched in the background, TERM is
+    sent to the pid the script recorded for itself, and the job has to end - fifo gone, exit code
+    recorded, hook dead - without restic ever having run. None of that is visible in the script
+    text, which is why it is tested here.
+    """
+
+    def start_job(self, pre="", post="", restic=FAKE_RESTIC):
+        ctx = self.prepare(pre=pre, post=post, restic=restic)
+        proc = subprocess.Popen(
+            ["/bin/sh", ctx["script"]], cwd=ctx["tmp"], env=ctx["env"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.addCleanup(self.stop, proc)
+        return ctx, proc
+
+    @staticmethod
+    def stop(proc):
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=15)
+        # The pipes are only there to keep the child from inheriting the test runner's stdio.
+        for stream in (proc.stdout, proc.stderr):
+            if stream is not None:
+                stream.close()
+
+    def script_pid(self, ctx, proc):
+        """The pid the script recorded for itself, once it has written it."""
+        path = os.path.join(ctx["jobs_dir"], os.path.basename(ctx["script"])[:-3] + ".shpid")
+        self.assertTrue(
+            self.wait_for(lambda: os.path.exists(path), 10),
+            "the job script never recorded its own pid in .shpid",
+        )
+        self.assertIsNone(proc.poll(), "the job script exited before it could be cancelled")
+        return int(read_text(path).strip())
+
+    def hook_pid(self, ctx):
+        self.assertTrue(
+            self.wait_for(lambda: os.path.exists(ctx["hook_pid_file"]), 10),
+            "the sleeping hook never started",
+        )
+        pid = int(read_text(ctx["hook_pid_file"]).strip())
+        self.assertIsNotNone(live_pid(pid), "the sleeping hook is already gone")
+        return pid
+
+    def test_term_during_a_pre_command_ends_the_job_and_never_starts_restic(self):
+        ctx, proc = self.start_job(pre=PRE_SLEEPS)
+        pid = self.script_pid(ctx, proc)
+
+        # The state the hole lived in: the pre-command is running, so restic has not started and
+        # there is no restic pid file for a cancel to find.
+        self.assertIsNone(maybe_text(ctx["pid_file"]), "restic started before the cancel")
+        hook = self.hook_pid(ctx)
+
+        os.kill(pid, signal.SIGTERM)
+        returncode = proc.wait(timeout=15)
+        result = self.read_outputs(ctx, returncode)
+
+        # The job ends on its own, with the code the trap chose.
+        self.assertEqual(returncode, 143, "the script must exit 143 when it is cancelled")
+        # The fifo is gone...
+        self.assertEqual(result["fifos_left"], [], "the trap must remove the fifo")
+        # ...the exit file records it, so the service finishes the job on its next poll instead of
+        # waiting for its own watchdog...
+        self.assertEqual(result["exit"].strip(), "143")
+        # ...the script's own pid was recorded for the whole run...
+        self.assertEqual(result["shpid"].strip(), str(pid))
+        # ...and restic never ran: no fake pid, no argv, no order entry, no pid file.
+        self.assertIsNone(result["fake_pid"], "the fake restic must never have run")
+        self.assertEqual(result["fake_argv"], [])
+        self.assertFalse(os.path.exists(ctx["order_file"]), "restic must never have been started")
+        self.assertIsNone(result["pid"], "restic's pid file must never exist")
+        # The trap killed the running hook: it is gone, not orphaned past the job.
+        self.assertTrue(
+            self.wait_for(lambda: live_pid(hook) is None, 5),
+            "the pre-command was still running after the cancel",
+        )
+        # The hook's output still reached the job log, behind its marker.
+        log_lines = result["log"].splitlines()
+        self.assertIn(PRE_MARKER, log_lines)
+        self.assertIn("pre-running", log_lines)
+
+    def test_term_while_restic_runs_ends_the_job_and_kills_the_child(self):
+        """The common cancel: restic is the running child, and the shell is blocked reading the
+        fifo when the signal arrives - the trap still has to run, and restic must not outlive the
+        job."""
+        ctx, proc = self.start_job(restic=FAKE_RESTIC_SLOW)
+        pid = self.script_pid(ctx, proc)
+        self.assertTrue(
+            self.wait_for(lambda: os.path.exists(ctx["pid_file"]), 10), "restic never started"
+        )
+        restic_pid = int(read_text(ctx["pid_file"]).strip())
+        self.assertIsNotNone(live_pid(restic_pid))
+        # A status line has been read, so the shell really is inside the fifo loop when the signal
+        # lands (the case the trap has to survive).
+        status_path = lambda: glob.glob(os.path.join(ctx["jobs_dir"], "*.status"))
+        self.assertTrue(
+            self.wait_for(lambda: bool(status_path()), 10),
+            "the script never read a status line from the fifo",
+        )
+
+        os.kill(pid, signal.SIGTERM)
+        returncode = proc.wait(timeout=15)
+        result = self.read_outputs(ctx, returncode)
+
+        self.assertEqual(returncode, 143, "the trap must run while the shell reads the fifo")
+        self.assertEqual(result["exit"].strip(), "143")
+        self.assertEqual(result["fifos_left"], [])
+        # It ignores SIGTERM on purpose: what makes it die is the fifo's reader going away, so its
+        # next write raises SIGPIPE. A child that outlived the job would hold the repository lock.
+        self.assertTrue(
+            self.wait_for(lambda: live_pid(restic_pid) is None, 10),
+            "a child that ignored SIGTERM outlived the job",
+        )
+
+    def test_term_during_a_post_command_ends_the_job_too(self):
+        ctx, proc = self.start_job(post=POST_SLEEPS)
+        pid = self.script_pid(ctx, proc)
+
+        # restic has to finish for the post-command to be reached at all; then the hook is the only
+        # thing left running, and a hung one used to be unkillable.
+        self.assertTrue(
+            self.wait_for(lambda: os.path.exists(ctx["order_file"]), 10), "restic never ran"
+        )
+        hook = self.hook_pid(ctx)
+
+        os.kill(pid, signal.SIGTERM)
+        returncode = proc.wait(timeout=15)
+        result = self.read_outputs(ctx, returncode)
+
+        self.assertEqual(returncode, 143)
+        self.assertEqual(result["exit"].strip(), "143")
+        self.assertEqual(result["fifos_left"], [])
+        self.assertEqual(result["order"], ["restic"], "restic must have run exactly once")
+        self.assertTrue(
+            self.wait_for(lambda: live_pid(hook) is None, 5),
+            "the post-command was still running after the cancel",
+        )
+        self.assertIn(POST_MARKER, result["log"].splitlines())
 
 
 if __name__ == "__main__":

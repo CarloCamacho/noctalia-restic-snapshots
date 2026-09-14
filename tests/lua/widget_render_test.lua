@@ -129,9 +129,16 @@ check("tooltip shows last run", tostring(tooltipFor("Last run")):find("ok", 1, t
 check("tooltip shows the next run", tostring(tooltipFor("Next run")):find("in ", 1, true) ~= nil, tostring(tooltipFor("Next run")))
 check("tooltip shows the restic version", tooltipFor("Restic") == "0.19.1", tostring(tooltipFor("Restic")))
 check("tooltip carries the documented rows",
-  tooltipKeys() == "Restic,Repository,Mode,Snapshots,Newest snapshot,Last run,Next run", tooltipKeys())
+  tooltipKeys() == "Restic,Repository,Mode,Snapshots,Newest snapshot,Last run,Last check,Last verified,Next run",
+  tooltipKeys())
 check("no progress row while idle", tooltipFor("Progress") == nil)
 check("no error row while healthy", tooltipFor("Error") == nil)
+check("the check row reads never before any check", tooltipFor("Last check") == "never",
+  tostring(tooltipFor("Last check")))
+check("the verification row reads never before any verification", tooltipFor("Last verified") == "never",
+  tostring(tooltipFor("Last verified")))
+check("no verification hint in the bar when nothing was verified",
+  H.find(H.tree, H.byKey("verify-hint")) == nil, H.text(H.tree))
 
 -- ── running ──────────────────────────────────────────────────────────────────
 
@@ -226,6 +233,84 @@ update()
 check("count label appears when enabled", H.text(H.tree):find("3", 1, true) ~= nil, H.text(H.tree))
 check("count label uses the state colour", glyph() ~= nil and glyph().props.color == "on_surface",
   glyph() ~= nil and glyph().props.color)
+
+-- ── the last check and the last verification (0.3.0) ────────────────────────
+-- status.checks = { lastAt, lastOk, numErrors } and status.verify = { lastAt, lastOk, checked,
+-- matched, failed, detail } are what the service publishes. The tooltip carries both next to the
+-- last run, and a verification the user must act on is labelled in the bar itself.
+
+H.stateValues["restic_status"].checks = { lastAt = 1788871002, lastOk = true, numErrors = 0 }
+H.stateValues["restic_status"].verify = {
+  lastAt = 1788874202, lastOk = true, checked = 4, matched = 4, failed = 0, detail = "4 of 4 files matched",
+}
+update()
+check("tooltip shows a passing check",
+  tooltipFor("Last check") == "1h ago · ok", tostring(tooltipFor("Last check")))
+check("tooltip shows a passed verification with its counts",
+  tooltipFor("Last verified") == "ok · 4 of 4 files matched 6m ago", tostring(tooltipFor("Last verified")))
+check("a passed verification adds no bar label",
+  H.find(H.tree, H.byKey("verify-hint")) == nil, H.text(H.tree))
+
+-- An errored check is reported as such, not silently green.
+H.stateValues["restic_status"].checks = { lastAt = 1788871002, lastOk = false, numErrors = 3 }
+update()
+check("tooltip reports an errored check",
+  tooltipFor("Last check") == "1h ago · failed · 3 errors", tostring(tooltipFor("Last check")))
+H.stateValues["restic_status"].checks = { lastAt = 1788871002, lastOk = true, numErrors = 3 }
+update()
+check("an error count outranks a lastOk of true in the tooltip",
+  tooltipFor("Last check") == "1h ago · failed · 3 errors", tostring(tooltipFor("Last check")))
+H.stateValues["restic_status"].checks = { lastAt = 1788871002, lastOk = true, numErrors = 0 }
+
+-- A failed verification reads as a failure in the tooltip, and the bar carries a label.
+H.stateValues["restic_status"].verify = {
+  lastAt = 1788874202, lastOk = false, checked = 3, matched = 1, failed = 2,
+  detail = "2 of 3 checked files do not match the backup: /home/ian/dots/x",
+}
+update()
+check("tooltip reports a failed verification with its counts",
+  tooltipFor("Last verified") == "failed · 2 of 3 files did not match 6m ago",
+  tostring(tooltipFor("Last verified")))
+local hint = H.find(H.tree, H.byKey("verify-hint"))
+check("a failed verification is labelled in the bar", hint ~= nil)
+check("the bar label names the feature and the failure",
+  hint ~= nil and hint.props.text == "Verify restore: failed", hint ~= nil and hint.props.text)
+check("the bar label uses the error colour", hint ~= nil and hint.props.color == "error",
+  hint ~= nil and hint.props.color)
+
+-- The honesty case: checked > 0 with nothing compared. The service publishes lastOk = true, and the
+-- widget must not read that as a verification.
+H.stateValues["restic_status"].verify = {
+  lastAt = 1788874202, lastOk = true, checked = 3, matched = 0, failed = 0,
+  detail = "3 file(s) restored and read back, but none could be compared with a live file",
+}
+update()
+check("an all-skipped verification does not read as ok in the tooltip",
+  tooltipFor("Last verified") == "0 of 3 files matched 6m ago", tostring(tooltipFor("Last verified")))
+hint = H.find(H.tree, H.byKey("verify-hint"))
+check("an all-skipped verification is hinted in the bar",
+  hint ~= nil and hint.props.text == "Verify restore: 0 of 3 files matched",
+  hint ~= nil and hint.props.text)
+check("the hint for a run that proved nothing is not a success colour",
+  hint ~= nil and hint.props.color == "tertiary", hint ~= nil and hint.props.color)
+
+-- A verification that could not run at all: failed, with nothing to count.
+H.stateValues["restic_status"].verify = {
+  lastAt = 1788874202, lastOk = false, checked = 0, matched = 0, failed = 0,
+  detail = "there is no snapshot to verify",
+}
+update()
+check("a verification that could not run reads as failed",
+  tooltipFor("Last verified") == "failed 6m ago", tostring(tooltipFor("Last verified")))
+check("a verification that could not run adds no counts to the tooltip",
+  tostring(tooltipFor("Last verified")):find("of 0", 1, true) == nil, tostring(tooltipFor("Last verified")))
+
+H.stateValues["restic_status"].checks = nil
+H.stateValues["restic_status"].verify = nil
+update()
+check("the check row goes back to never", tooltipFor("Last check") == "never", tostring(tooltipFor("Last check")))
+check("the verification row goes back to never",
+  tooltipFor("Last verified") == "never", tostring(tooltipFor("Last verified")))
 
 -- ── click behaviour ──────────────────────────────────────────────────────────
 

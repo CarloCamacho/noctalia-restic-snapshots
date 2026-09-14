@@ -12,7 +12,7 @@
 id          = "carlocamacho/restic-snapshots"
 name        = "Restic Snapshots"
 icon        = "archive"
-version     = "0.2.0"
+version     = "0.3.0"
 plugin_api  = 30
 author      = "carlocamacho"
 license     = "MIT"
@@ -170,6 +170,48 @@ label_key = "settings.restic_bin.label"
 default   = "restic"
 advanced  = true
 
+[[setting]]
+key             = "pre_backup_command"
+type            = "string"
+label_key       = "settings.pre_backup_command.label"
+description_key = "settings.pre_backup_command.description"
+default         = ""
+advanced        = true
+
+[[setting]]
+key             = "post_backup_command"
+type            = "string"
+label_key       = "settings.post_backup_command.label"
+description_key = "settings.post_backup_command.description"
+default         = ""
+advanced        = true
+
+[[setting]]
+key             = "verify_interval_hours"
+type            = "int"
+label_key       = "settings.verify_interval_hours.label"
+description_key = "settings.verify_interval_hours.description"
+default         = 0
+min             = 0
+max             = 720
+
+[[setting]]
+key             = "verify_file_count"
+type            = "int"
+label_key       = "settings.verify_file_count.label"
+description_key = "settings.verify_file_count.description"
+default         = 3
+min             = 1
+max             = 25
+
+[[setting]]
+key             = "metrics_dir"
+type            = "folder"
+label_key       = "settings.metrics_dir.label"
+description_key = "settings.metrics_dir.description"
+default         = ""
+advanced        = true
+
 [[service]]
 id    = "service"
 entry = "service.luau"
@@ -193,6 +235,16 @@ entry = "widget.luau"
 [[shortcut]]
 id    = "backup_now"
 entry = "shortcut.luau"
+
+[[launcher_provider]]
+id     = "snapshots"
+entry  = "launcher.luau"
+prefix = "/snap"
+glyph  = "archive"
+
+  [[launcher_provider.category]]
+  label = "Snapshots"
+  glyph = "archive"
 
 [[panel]]
 id                       = "browser"
