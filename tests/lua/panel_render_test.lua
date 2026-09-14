@@ -8,7 +8,7 @@ local H = dofile("tests/lua/harness.lua")
 H.install("plugin/restic-snapshots")
 
 H.stateValues["restic_status"] = {
-  schema = 1,
+  schema = 2,
   updatedAt = 1788874602,
   available = true,
   version = "0.19.1",
@@ -23,7 +23,7 @@ H.stateValues["restic_status"] = {
   error = "",
 }
 H.stateValues["restic_snapshots"] = {
-  schema = 1,
+  schema = 2,
   updatedAt = 1788874602,
   snapshots = {
     { id = "abc123", shortId = "abc12345", time = "2026-09-08T22:15:06+08:00", hostname = "host",

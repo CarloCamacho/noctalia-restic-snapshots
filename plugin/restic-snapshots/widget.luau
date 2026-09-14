@@ -37,6 +37,16 @@ local function render()
     table.insert(children, ui.label({ text = tostring(status.snapshotCount or 0), color = colour }))
   end
 
+  -- [0.2.0] staleness readout. `status.stale` / `status.staleness` are published by the service;
+  -- the label stays out of the bar unless the snapshot age actually crossed the threshold.
+  if noctalia.getConfig("show_staleness") == true and status.stale == true and status.staleness ~= nil then
+    table.insert(children, ui.label({
+      text = string.format("%.0fh", tonumber(status.staleness) or 0),
+      color = "error",
+      fontSize = 11,
+    }))
+  end
+
   barWidget.render(ui.row({ gap = 6, align = "center" }, children))
 
   local rows = {}
@@ -51,11 +61,19 @@ local function render()
     row("Repository", status.repoConfigured and status.repository or "not configured")
     row("Mode", status.mode)
     row("Snapshots", status.snapshotCount or 0)
+    if status.newestSnapshotAt ~= nil then
+      row("Newest snapshot", restic.ageLabel(nowSec() - status.newestSnapshotAt) .. " ago")
+    end
+    if status.stale == true then
+      row("Stale", status.staleness ~= nil and (string.format("%.0fh", status.staleness) .. " old") or "yes")
+    end
     if status.job ~= nil and status.job.percent ~= nil then
       row("Progress", string.format("%.0f%%", tonumber(status.job.percent) * 100))
     end
     if status.lastRun ~= nil then
-      row("Last run", (status.lastRun.ok and "ok " or "failed ") .. restic.ageLabel(nowSec() - (status.lastRun.at or nowSec())) .. " ago")
+      local state_ = status.lastRun.cancelled == true and "cancelled"
+        or (status.lastRun.ok and "ok" or "failed")
+      row("Last run", state_ .. " " .. restic.ageLabel(nowSec() - (status.lastRun.at or nowSec())) .. " ago")
     else
       row("Last run", "never")
     end

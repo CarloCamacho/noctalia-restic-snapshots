@@ -8,7 +8,7 @@ local H = dofile("tests/lua/harness.lua")
 H.install("plugin/restic-snapshots")
 
 H.stateValues["restic_status"] = {
-  schema = 1,
+  schema = 2,
   updatedAt = 1788874602,
   available = true,
   version = "0.19.1",
