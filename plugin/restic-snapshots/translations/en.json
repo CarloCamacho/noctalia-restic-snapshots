@@ -157,6 +157,5 @@
   "launcher.action.backup_now": "Back up now",
   "launcher.action.open_panel": "Open Restic Snapshots",
   "launcher.action.check": "Check repository",
-  "launcher.snapshot.subtitle": "{host} · {files} files · {size}",
-  "launcher.category.snapshots": "Restic snapshots"
+  "launcher.snapshot.subtitle": "{host} · {files} files · {size}"
 }
