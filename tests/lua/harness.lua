@@ -38,6 +38,8 @@ H.commands = {}
 H.pending = {}
 H.logs = {}
 H.files = {}
+H.fsCalls = {}       -- every filesystem call, in order (name + path/text)
+H.failCalls = {}     -- set e.g. H.failCalls.renameFile = true to simulate a failure
 H.mtimes = {}        -- [path] = epoch seconds (or ms); drives jobs.sweep tests
 H.published = {}
 H.stateValues = {}   -- key -> value returned by state.get
@@ -104,6 +106,8 @@ function H.install(plugin_dir)
   H.pending = {}
   H.logs = {}
   H.files = {}
+  H.fsCalls = {}
+  H.failCalls = {}
   H.mtimes = {}
   H.published = {}
   H.stateValues = {}
@@ -129,10 +133,32 @@ function H.install(plugin_dir)
     end,
     listDir = function() return {} end,
     pluginDataDir = function() return "/tmp/restic-data" end,
-    mkdirAll = function() return true end,
+    mkdirAll = function(path)
+      table.insert(H.fsCalls, { name = "mkdirAll", path = path })
+      return true
+    end,
     readFile = function(path) return H.files[path] end,
-    writeFile = function(path, contents) H.files[path] = contents; return true end,
-    removeFile = function(path) H.files[path] = nil; return true end,
+    writeFile = function(path, contents)
+      table.insert(H.fsCalls, { name = "writeFile", path = path, text = contents })
+      if H.failCalls.writeFile then return false, "simulated write failure" end
+      H.files[path] = contents; return true
+    end,
+    removeFile = function(path)
+      table.insert(H.fsCalls, { name = "removeFile", path = path })
+      if H.failCalls.removeFile then return false, "simulated remove failure" end
+      H.files[path] = nil; return true
+    end,
+    -- The host publishes atomically (write a temp file, then rename it into place), so a
+    -- reader never sees a partial file. Modelled faithfully: the rename fails when the
+    -- source is missing, and the move is observable through H.files.
+    renameFile = function(from, to)
+      table.insert(H.fsCalls, { name = "renameFile", from = from, to = to })
+      if H.failCalls.renameFile then return false, "simulated rename failure" end
+      if H.files[from] == nil then return false, "no such file: " .. tostring(from) end
+      H.files[to] = H.files[from]
+      H.files[from] = nil
+      return true
+    end,
     commandExists = function() return true end,
     notify = function(...) table.insert(H.logs, "notify: " .. tostring(select(1, ...))) end,
     notifyError = function(...) table.insert(H.logs, "error: " .. tostring(select(1, ...))) end,
