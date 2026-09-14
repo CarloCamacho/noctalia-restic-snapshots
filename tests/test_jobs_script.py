@@ -5,6 +5,11 @@ script, writes it to disk and runs it through /bin/sh with a fake `restic`, so t
 the stdout/stderr split, the recorded pid, the exit-code file and the argument quoting are
 exercised by a real shell. That is the only way to prove the generated script actually works.
 
+The 0.3.0 pre/post-backup hooks are verified the same way, because ordering, exit codes and the log
+markers are things only a real shell can settle: the pre-command must run before restic, a failing
+one must abort before restic, the post-command must see restic's code in RESTIC_EXIT, and its own
+failure must not become the job's recorded result.
+
 Skipped when lua5.4 (used to drive the generator through the shared harness) is unavailable.
 """
 
@@ -21,17 +26,22 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PLUGIN_DIR = "plugin/restic-snapshots"
 LUA = shutil.which("lua5.4") or shutil.which("lua")
 
+# The 0.3.0 freeze commit ("chore(0.3.0): freeze the feature contracts"). Its lib/jobs.luau is the
+# 0.2.0 generator, which is what contract 5.3 demands a hook-free job still be byte-identical to.
+BASE_REV = "c03eced"
+
 # Drives the plugin's own generator through tests/lua/harness.lua and drops the script it writes
 # onto the real filesystem (the harness only keeps it in memory). Args: dataDir resticPath
-# hostileArg envFile.
+# hostileArg envFile preCommand postCommand pluginDir ("" = that option is unset).
 GENERATOR_LUA = textwrap.dedent(
     """
     package.path = "tests/lua/?.lua;" .. package.path
     local H = dofile("tests/lua/harness.lua")
-    H.install("plugin/restic-snapshots")
+
+    local dataDir, resticPath, hostile, envFile, preCommand, postCommand, pluginDir = ...
+    H.install((pluginDir ~= nil and pluginDir ~= "") and pluginDir or "plugin/restic-snapshots")
     local jobs = H.load("lib/jobs.luau")
 
-    local dataDir, resticPath, hostile, envFile = ...
     _G.noctalia.pluginDataDir = function() return dataDir end
 
     local argv = {
@@ -41,6 +51,8 @@ GENERATOR_LUA = textwrap.dedent(
     local token, err, paths = jobs.start(argv, {
       pathPrefix = "/usr/bin:/bin",
       envFile = (envFile ~= "" and envFile or nil),
+      preCommand = (preCommand ~= "" and preCommand or nil),
+      postCommand = (postCommand ~= "" and postCommand or nil),
     })
     assert(token ~= nil, tostring(err))
 
@@ -52,9 +64,11 @@ GENERATOR_LUA = textwrap.dedent(
     """
 )
 
-# A fake restic: records its own pid, its argv ($0 included), and the fifo's mode, then emits two
-# status lines on stdout, one noise line on stderr, an env probe, and a summary line.
+# A fake restic: records that it started (before anything else, so the ordering of a pre-command
+# against it is observable), its own pid, its argv ($0 included), and the fifo's mode, then emits
+# two status lines on stdout, one noise line on stderr, an env probe, and a summary line.
 FAKE_RESTIC = """#!/bin/sh
+printf '%s\\n' restic >> "$FAKE_ORDER_FILE"
 printf '%s' "$$" > "$FAKE_PID_FILE"
 printf '%s\\n' "$0" "$@" > "$FAKE_ARGV_FILE"
 sleep 0.3
@@ -76,18 +90,32 @@ SUMMARY = '{"message_type":"summary","total_files_processed":10,"total_bytes_pro
 NOISE = "restic: plain noise on stderr"
 HOSTILE = "/tmp/it's a $(dangerous) `command` path && echo pwned"
 
+PRE_MARKER = "== pre-backup command =="
+POST_MARKER = "== post-backup command =="
+
+# Hook commands. They are user-supplied shell strings, so they carry shell metacharacters on
+# purpose - including a `$VAR` only the job script's environment can expand.
+PRE_ORDER = 'echo pre; echo pre >> "$FAKE_ORDER_FILE"'
+POST_ORDER = 'echo post; echo post >> "$FAKE_ORDER_FILE"'
+PRE_FAILS = 'echo pre-boom; echo pre >> "$FAKE_ORDER_FILE"; exit 3'
+POST_BOOM = "echo post-boom; exit 9"
+POST_REPORTS_EXIT = 'echo "restic-exit:$RESTIC_EXIT"'
+HOSTILE_PRE = 'echo "cmd:<it\'s a $(echo SUB) value>"'
+
 
 def mode_of(path):
     return stat.S_IMODE(os.stat(path).st_mode)
 
 
-class JobScriptTest(unittest.TestCase):
+class JobScriptHarness(unittest.TestCase):
+    """Shared generator/runner plumbing. No tests of its own."""
+
     @classmethod
     def setUpClass(cls):
         if LUA is None:
             raise unittest.SkipTest("lua5.4 is not available to drive the generator")
 
-    def run_job(self, exit_code=0, with_env_file=True):
+    def run_job(self, exit_code=0, with_env_file=True, pre="", post="", plugin_dir=""):
         """Generate a script with the plugin's generator, run it, return everything it wrote."""
         tmp = tempfile.mkdtemp(prefix="jobs-script-")
         self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
@@ -115,19 +143,31 @@ class JobScriptTest(unittest.TestCase):
         pid_file = os.path.join(tmp, "fake.pid")
         argv_file = os.path.join(tmp, "fake.argv")
         mode_file = os.path.join(tmp, "fake.mode")
+        order_file = os.path.join(tmp, "fake.order")
         env = dict(os.environ)
         env.update(
             {
                 "FAKE_PID_FILE": pid_file,
                 "FAKE_ARGV_FILE": argv_file,
                 "FAKE_MODE_FILE": mode_file,
+                "FAKE_ORDER_FILE": order_file,
                 "FAKE_JOBS_DIR": jobs_dir,
                 "FAKE_EXIT_CODE": str(exit_code),
             }
         )
 
         generated = subprocess.run(
-            [LUA, driver, data_dir, restic_path, HOSTILE, env_file if with_env_file else ""],
+            [
+                LUA,
+                driver,
+                data_dir,
+                restic_path,
+                HOSTILE,
+                env_file if with_env_file else "",
+                pre,
+                post,
+                plugin_dir,
+            ],
             cwd=REPO_ROOT,
             env=env,
             capture_output=True,
@@ -171,10 +211,13 @@ class JobScriptTest(unittest.TestCase):
             "fake_pid": maybe_read(pid_file),
             "fake_argv": read(argv_file).splitlines() if os.path.exists(argv_file) else [],
             "fifo_modes": read(mode_file).splitlines() if os.path.exists(mode_file) else [],
+            "order": read(order_file).splitlines() if os.path.exists(order_file) else [],
             "restic_path": restic_path,
             "data_dir": data_dir,
         }
 
+
+class JobScriptTest(JobScriptHarness):
     def test_shell_run_splits_output_records_restics_pid_and_exit_code(self):
         result = self.run_job(exit_code=7, with_env_file=True)
         log_lines = result["log"].splitlines()
@@ -242,6 +285,133 @@ class JobScriptTest(unittest.TestCase):
         self.assertEqual(result["status"].strip(), STATUS_LAST)
         self.assertEqual(result["pid"].strip(), result["fake_pid"].strip())
         self.assertEqual(result["exit"].strip(), "0")
+
+
+class JobScriptHooksTest(JobScriptHarness):
+    """0.3.0 pre/post-backup hooks, run by a real /bin/sh against the fake restic."""
+
+    def test_hooks_run_around_restic_and_mark_the_log(self):
+        result = self.run_job(exit_code=0, pre=PRE_ORDER, post=POST_ORDER)
+        log_lines = result["log"].splitlines()
+
+        # The order file is written by the fake restic and by both hook commands: whatever
+        # sequential order it holds is the order the shell really executed them in.
+        self.assertEqual(
+            result["order"], ["pre", "restic", "post"],
+            "the pre-command must finish before restic starts, the post-command after it",
+        )
+
+        # Both marker lines are in the job log, each immediately before its own command's output.
+        self.assertIn(PRE_MARKER, log_lines)
+        self.assertIn(POST_MARKER, log_lines)
+        self.assertLess(log_lines.index(PRE_MARKER), log_lines.index("pre"))
+        self.assertLess(log_lines.index("pre"), log_lines.index(SUMMARY))
+        self.assertLess(log_lines.index(SUMMARY), log_lines.index(POST_MARKER))
+        self.assertLess(log_lines.index(POST_MARKER), log_lines.index("post"))
+
+        # Hooks change nothing about the rest of the job.
+        self.assertEqual(result["returncode"], 0)
+        self.assertEqual(result["exit"].strip(), "0")
+        self.assertEqual(result["pid"].strip(), result["fake_pid"].strip())
+        self.assertEqual(result["status"].strip(), STATUS_LAST)
+        self.assertEqual(result["fifos_left"], [])
+
+    def test_a_failing_pre_command_aborts_before_restic(self):
+        result = self.run_job(exit_code=0, pre=PRE_FAILS)
+        log_lines = result["log"].splitlines()
+
+        # restic was never started: it did not append to the order file, wrote neither pid nor argv.
+        self.assertEqual(result["order"], ["pre"], "restic must not have run")
+        self.assertIsNone(result["fake_pid"], "the fake restic must never have started")
+        self.assertEqual(result["fake_argv"], [])
+        self.assertNotIn(SUMMARY, log_lines)
+
+        # The pre-command's own status is the job's result, in the file and as the script's code.
+        self.assertEqual(result["exit"].strip(), "3")
+        self.assertEqual(result["returncode"], 3, "the script must exit with the pre-command's code")
+
+        # Its output is still in the log, behind the marker, and the fifo is cleaned up.
+        self.assertIn(PRE_MARKER, log_lines)
+        self.assertIn("pre-boom", log_lines)
+        self.assertNotIn(POST_MARKER, log_lines)
+        self.assertEqual(result["fifos_left"], [])
+
+    def test_the_post_command_receives_restics_exit_code(self):
+        result = self.run_job(exit_code=5, post=POST_REPORTS_EXIT)
+        log_lines = result["log"].splitlines()
+
+        self.assertIn("restic-exit:5", log_lines, "the post-command never saw RESTIC_EXIT")
+        # A successful post-command leaves the backup's code alone.
+        self.assertEqual(result["exit"].strip(), "5")
+        self.assertIn(POST_MARKER, log_lines)
+
+    def test_a_failing_post_command_keeps_restics_exit_code(self):
+        result = self.run_job(exit_code=4, post=POST_BOOM)
+        log_lines = result["log"].splitlines()
+
+        self.assertIn("post-boom", log_lines, "the post-command never ran")
+        self.assertEqual(result["exit"].strip(), "4", "the recorded result is restic's")
+        self.assertEqual(result["returncode"], 0, "the wrapper script itself still exits 0")
+        self.assertEqual(result["order"], ["restic"])
+
+    def test_the_post_command_runs_after_a_failed_backup(self):
+        result = self.run_job(exit_code=6, post=POST_REPORTS_EXIT, pre=PRE_ORDER)
+        log_lines = result["log"].splitlines()
+
+        self.assertEqual(result["order"], ["pre", "restic"])
+        self.assertIn("restic-exit:6", log_lines)
+        self.assertEqual(result["exit"].strip(), "6")
+
+    def test_a_hostile_command_value_round_trips_through_the_shell(self):
+        # The value contains a single quote and a `$(...)`: if it were not written as one quoted
+        # word, the script would either fail to parse or run the substitution itself.
+        result = self.run_job(exit_code=0, pre=HOSTILE_PRE, post=POST_ORDER)
+        log_lines = result["log"].splitlines()
+
+        self.assertIn("cmd:<it's a SUB value>", log_lines)
+        self.assertEqual(result["order"], ["restic", "post"], "the pre-command never completed")
+        self.assertEqual(result["exit"].strip(), "0")
+
+    def test_without_hooks_the_script_has_no_trace_of_them(self):
+        result = self.run_job(exit_code=0)
+        log_lines = result["log"].splitlines()
+
+        for marker in (PRE_MARKER, POST_MARKER):
+            self.assertNotIn(marker, log_lines)
+            self.assertNotIn(marker, result["script_text"])
+        for artefact in ("/bin/sh -c", "PRECOMMAND", "POSTCOMMAND", "RESTIC_EXIT", "prestatus"):
+            self.assertNotIn(artefact, result["script_text"])
+
+        # The job itself is unchanged, and the hooks would have shown up in the order file.
+        self.assertEqual(result["order"], ["restic"])
+        self.assertEqual(result["exit"].strip(), "0")
+        self.assertEqual(result["status"].strip(), STATUS_LAST)
+
+    def test_hook_free_script_is_byte_identical_to_the_pre_hooks_generator(self):
+        """Contract 5.3: with neither option set the script must be today's script, byte for byte."""
+        baseline = subprocess.run(
+            ["git", "-C", REPO_ROOT, "show", BASE_REV + ":" + PLUGIN_DIR + "/lib/jobs.luau"],
+            capture_output=True,
+            text=True,
+        )
+        if baseline.returncode != 0:
+            self.skipTest("the pre-hooks generator (%s) is not in this checkout" % BASE_REV)
+
+        tmp = tempfile.mkdtemp(prefix="jobs-baseline-")
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        base_plugin = os.path.join(tmp, PLUGIN_DIR.replace("/", "_"))
+        shutil.copytree(os.path.join(REPO_ROOT, PLUGIN_DIR), base_plugin)
+        with open(os.path.join(base_plugin, "lib", "jobs.luau"), "w") as handle:
+            handle.write(baseline.stdout)
+
+        old = self.run_job(exit_code=0, plugin_dir=base_plugin)
+        new = self.run_job(exit_code=0)
+
+        # Only the per-run tmp directory (which the job token lives under) may differ.
+        def normalized(result):
+            return result["script_text"].replace(result["tmp"], "<TMP>")
+
+        self.assertEqual(normalized(old), normalized(new))
 
 
 if __name__ == "__main__":
