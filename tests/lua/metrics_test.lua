@@ -1,13 +1,14 @@
 --!nonstrict
 -- Tests for lib/metrics.luau: the Prometheus textfile export.
+-- Run from the repo root:  lua5.4 tests/lua/metrics_test.lua
 --
 -- The properties under test are the ones a graph depends on: an unknown value is ABSENT (never a
 -- confident 0), the file is valid exposition format (every HELP has a TYPE, every sample a value),
 -- and the write is atomic (temp + rename, so a scraper never reads half a file).
-local here = (debug.getinfo(1, "S").source:sub(2)):match("^(.*)/tests/lua/")
-local harness = dofile(here .. "/tests/lua/harness.lua")
-local H = harness.new()
-local metrics = require(here .. "/lib/metrics.luau")
+package.path = "tests/lua/?.lua;" .. package.path
+local H = dofile("tests/lua/harness.lua")
+H.install("plugin/restic-snapshots")
+local metrics = H.load("lib/metrics.luau")
 
 local checks = 0
 local failures = 0
@@ -41,7 +42,7 @@ local function find(text, name)
 end
 
 -- ── a full set of known values ───────────────────────────────────────────────
-H.reset()
+H.install("plugin/restic-snapshots")
 local text = metrics.render(1789397000, {
   lastSuccessAt = 1789396641,
   snapshotCount = 2,
@@ -91,7 +92,7 @@ for _, line in ipairs(lines(text)) do
   end
 end
 ok(helpCount == typeCount, "every HELP has a matching TYPE")
-ok(#lines(text) == helpCount + typeCount + (helpCount - 1), "one sample per HELP block")
+ok(#lines(text) == helpCount * 3, "every metric is HELP + TYPE + one sample")
 
 -- ── unknown values are absent, not zero ─────────────────────────────────────
 local bare = metrics.render(1789397000, {})
@@ -117,6 +118,7 @@ ok(find(zero, "restic_snapshots_last_check_errors") == "restic_snapshots_last_ch
 -- Hostile / odd inputs must not produce a corrupt file.
 local nasty = metrics.render(1789397000, {
   jobKind = 'back\\up"now\nrm -rf',
+  jobExitCode = 130,      -- the label is only emitted with a real value: that is the point
   lastSuccessAt = 0,
   repoBytes = -1,
   snapshotCount = "12",
@@ -144,12 +146,12 @@ ok(find(skewed, "restic_snapshots_newest_age_seconds") ==
   "restic_snapshots_newest_age_seconds 0", "a future snapshot timestamp clamps the age to 0")
 
 -- ── M.write is atomic and off by default ────────────────────────────────────
-H.reset()
+H.install("plugin/restic-snapshots")
 local written, reason = metrics.write("", "x")
 ok(written == false and type(reason) == "string", "an unset directory is a soft refusal")
 ok(#H.commands == 0, "the export spawns no process")
 
-H.reset()
+H.install("plugin/restic-snapshots")
 local okw, path = metrics.write("/home/tester/metrics", text)
 ok(okw == true, "a configured directory is written")
 ok(path == "/home/tester/metrics/restic_snapshots.prom", "the file name is fixed")
@@ -170,18 +172,18 @@ ok(wroteTmp, "the text is written to the temp path first")
 ok(moved, "the temp file is renamed onto the final path (atomic publish)")
 
 -- A trailing slash in the setting must not double up.
-H.reset()
+H.install("plugin/restic-snapshots")
 local okSlash, slashPath = metrics.write("/home/tester/metrics/", text)
 ok(okSlash == true and slashPath == "/home/tester/metrics/restic_snapshots.prom",
   "a trailing slash is tolerated")
 
 -- Nothing to write is a refusal, not an empty file.
-H.reset()
+H.install("plugin/restic-snapshots")
 local okEmpty = metrics.write("/home/tester/metrics", "")
 ok(okEmpty == false, "an empty render is not published")
 
 -- A failing rename must not leave the temp file behind claiming to be current.
-H.reset()
+H.install("plugin/restic-snapshots")
 H.failCalls = { renameFile = true }
 local okFail, failReason = metrics.write("/home/tester/metrics", text)
 ok(okFail == false and type(failReason) == "string", "a failed publish is reported")
