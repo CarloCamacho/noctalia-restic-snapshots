@@ -6,10 +6,19 @@
 -- left over from another tab can never be clicked. Restore previews before it confirms: the
 -- one-click restore was the review finding that produced 0.2.0.
 --
+-- [0.3.0] The Run tab renders the two results the service had been publishing invisibly -- the last
+-- integrity check (`status.checks`) and the last restore verification (`status.verify`, with its
+-- counts, the service's own detail sentence and a "Verify restore" button sending EVENT_VERIFY) --
+-- the diff lists the changed paths instead of only counting them, and "this host only" reads the
+-- real hostname from /etc/hostname instead of inferring it from the snapshot list.
+--
 -- Invariants this file keeps (see docs/CONTRACTS-0.2.0.md 4.8):
 --   * `status.repository` is ALREADY redacted by the service -- the panel never redacts it again.
 --   * a retention preview is NOT re-summed: keepCount / removeCount / remove come straight from
 --     restic.summariseForgetDry via the service, the panel only renders them.
+--   * the panel does not grade results: a verification's verdict comes from its published counts
+--     (`lastOk` alone would call a run that compared nothing a success) and the check's result from
+--     `lastOk` plus `numErrors`.
 --   * every user-visible string goes through noctalia.tr with a key from translations/en.json.
 
 local restic = require("./lib/restic.luau")
@@ -31,6 +40,7 @@ local diff = noctalia.state.get(state.KEY_DIFF)
 local MAX_ROWS = 60
 local MAX_FILE_ROWS = 12
 local MAX_REMOVE_ROWS = 20
+local MAX_DIFF_ROWS = 12
 
 local ui_state = {
   tab = "snapshots",
@@ -134,13 +144,32 @@ local function hasTag(row, tag)
   return false
 end
 
--- "This host only" needs a hostname and the status shape deliberately carries none -- the service
--- publishes display fields only. This plugin's own snapshots are exactly the ones carrying the
--- configured backup tag, so the hostname of the newest tagged snapshot is this host's; with no
--- tagged snapshot at all the newest snapshot's hostname is the best answer available, so the
--- filter is never a silent no-op. Reported to the lead: the service could publish the local
--- hostname outright and this inference could go away.
-local function localHostname(list, tag)
+-- The real local hostname, from /etc/hostname (trimmed). The host names its own machine, so this is
+-- exact; there is no inference to be wrong. No cache: the file is a few bytes, the panel renders on
+-- user action and on state publishes (not on a timer), and a cached value could outlive a rename.
+local function readLocalHostname()
+  local text = noctalia.readFile("/etc/hostname")
+  if type(text) ~= "string" then
+    return nil
+  end
+  -- Trimmed with two whole-string gsubs, never a per-character walk (the host runs callbacks under a
+  -- CPU budget).
+  local trimmed = (text:gsub("^%s+", ""):gsub("%s+$", ""))
+  if trimmed == "" then
+    return nil
+  end
+  return trimmed
+end
+
+-- "This host only" used to be inferred, because the status shape deliberately carries no hostname
+-- (the service publishes display fields only) and this plugin's snapshots were assumed to be exactly
+-- the ones carrying the configured backup tag. That inference was NOT enough: restic records the
+-- hostname of the machine that *made* the snapshot, and one repository can hold snapshots from
+-- several machines -- including one where the same tag is configured -- so the newest tagged row is
+-- not necessarily this host. The filter then silently showed / hid the wrong host's snapshots with
+-- nothing on screen to reveal it. /etc/hostname is the machine's own answer, so read it first and
+-- keep the inference only as the fallback for when the file is unreadable (a container, a chroot).
+local function inferredHostname(list, tag)
   for _, row in ipairs(list) do
     if hasTag(row, tag) and row.hostname ~= nil then
       return row.hostname
@@ -152,6 +181,14 @@ local function localHostname(list, tag)
     end
   end
   return nil
+end
+
+local function localHostname(list, tag)
+  local exact = readLocalHostname()
+  if exact ~= nil then
+    return exact
+  end
+  return inferredHostname(list, tag)
 end
 
 -- A total order: a row with an unreadable time sorts as the oldest rather than making the
@@ -531,12 +568,69 @@ local function filesSection()
   return out
 end
 
+-- The diff's changed-path lists. restic.parseDiff returns them as addedPaths / removedPaths /
+-- changedPaths; the brief that asked for this rendering names them "added/removed/changed" and the
+-- counts already occupy those names, so an array under either name is read -- a shape mismatch must
+-- not silently empty the list, because a silently truncated list is a lie about the repository. Only
+-- string entries are rendered: a nested statistics table must never be shown as "table: 0x...".
+local function pathList(source, primary, fallback)
+  local list = source[primary]
+  if type(list) ~= "table" then
+    list = source[fallback]
+  end
+  if type(list) ~= "table" then
+    return {}
+  end
+  local out = {}
+  for _, entry in ipairs(list) do
+    if type(entry) == "string" then
+      table.insert(out, entry)
+    end
+  end
+  return out
+end
+
+-- The count beside each list: the payload's own number when it carries one, otherwise the number of
+-- paths it shipped. Never `tostring(<table>)` under a count, and never a hard 0 that would understate
+-- what changed.
+local function countOf(value, list)
+  local number = tonumber(value)
+  if number ~= nil then
+    return number
+  end
+  return #list
+end
+
+-- One bounded pass over the three lists (records, never bytes): at most MAX_DIFF_ROWS rows, exactly
+-- like the file listing. Returns how many rows were written so the caller can state what it left out.
+-- The +/~/- markers are diff syntax rather than prose, so they need no translation key (en.json has
+-- no per-direction path heading; `panel.label.diff_paths` labels the list).
+local function diffPathRows(out, groups)
+  local shown = 0
+  for _, group in ipairs(groups) do
+    for _, path in ipairs(group.paths) do
+      if shown >= MAX_DIFF_ROWS then
+        return shown
+      end
+      shown = shown + 1
+      table.insert(out, ui.row({ key = "diff-path-" .. tostring(shown), gap = 8, align = "center" }, {
+        ui.label({ text = group.marker, color = group.color, fontSize = 11 }),
+        ui.label({ text = path, fontSize = 11, maxLines = 1 }),
+      }))
+    end
+  end
+  return shown
+end
+
 local function diffSection()
   if type(diff) ~= "table" or diff.ok == false then
     return {}
   end
-  -- Counts only: the path lists are bounded in lib/restic and deliberately not rendered.
-  return {
+  -- Counts first, then the paths, in the order the counts line names them.
+  local added = pathList(diff, "addedPaths", "added")
+  local removed = pathList(diff, "removedPaths", "removed")
+  local changed = pathList(diff, "changedPaths", "changed")
+  local out = {
     ui.separator({}),
     ui.row({ gap = 8, align = "center" }, {
       ui.label({
@@ -554,13 +648,50 @@ local function diffSection()
     ui.label({
       key = "diff-counts",
       text = tr("panel.diff.counts", {
-        added = tostring(diff.added or 0),
-        removed = tostring(diff.removed or 0),
-        changed = tostring(diff.changed or 0),
+        added = tostring(countOf(diff.added, added)),
+        removed = tostring(countOf(diff.removed, removed)),
+        changed = tostring(countOf(diff.changed, changed)),
       }),
       fontSize = 12,
     }),
   }
+
+  local groups = {
+    { marker = "+", color = "primary", paths = added },
+    { marker = "-", color = "error", paths = removed },
+    { marker = "~", color = "on_surface/0.6", paths = changed },
+  }
+  local total = #added + #removed + #changed
+  if total == 0 then
+    return out
+  end
+
+  table.insert(out, ui.label({
+    key = "diff-paths-title",
+    text = tr("panel.label.diff_paths"),
+    color = "on_surface/0.7",
+    fontSize = 12,
+  }))
+  local shown = diffPathRows(out, groups)
+  if total > shown then
+    -- Exact: these paths arrived in the payload and this bound left them out.
+    table.insert(out, ui.label({
+      key = "diff-more",
+      text = tr("panel.label.diff_more", { count = tostring(total - shown) }),
+      color = "on_surface/0.5",
+      fontSize = 11,
+    }))
+  elseif diff.truncated == true then
+    -- The parser cut the lists before the panel saw them, so the number still missing is unknown --
+    -- stating a count here would be a guess. Say only what is known: how many were listed.
+    table.insert(out, ui.label({
+      key = "diff-truncated",
+      text = tr("panel.files.truncated", { lines = tostring(shown) }),
+      color = "on_surface/0.5",
+      fontSize = 11,
+    }))
+  end
+  return out
 end
 
 local function snapshotsTab()
@@ -777,6 +908,140 @@ local function lastRunLine()
   })
 end
 
+-- The last integrity check. status.checks is published by the service as { lastAt, lastOk, numErrors }
+-- (numErrors is restic's own summary count, nil when the run produced no summary). Until 0.3.0 only
+-- the Log tab showed it, so a check that reported errors was effectively invisible.
+local function checksLine()
+  local checks = status.checks
+  local at = type(checks) == "table" and tonumber(checks.lastAt) or nil
+  local value
+  local problem = false
+  if at == nil then
+    value = tr("panel.label.never")
+  else
+    local errors = tonumber(checks.numErrors) or 0
+    local verdict = tr("panel.label.ok")
+    if errors > 0 then
+      -- The error count outranks a lastOk of true: "ok · 3 errors" contradicts itself, and a check
+      -- that found errors must never read as green.
+      verdict = tr("panel.label.failed") .. " · " .. tr("panel.label.check_errors", { errors = tostring(errors) })
+      problem = true
+    elseif checks.lastOk ~= true then
+      verdict = tr("panel.label.failed")
+      problem = true
+    end
+    value = agoLabel(at) .. " · " .. verdict
+  end
+  return ui.row({ key = "checks-line", gap = 8, align = "center" }, {
+    ui.glyph({ name = "shield-check", size = 13, color = problem and "error" or "on_surface/0.6" }),
+    ui.label({ text = tr("panel.label.last_check"), color = "on_surface/0.6", fontSize = 12 }),
+    ui.spacer({ flexGrow = 1 }),
+    ui.label({ key = "checks-value", text = value, color = problem and "error" or "on_surface", fontSize = 12 }),
+  })
+end
+
+-- The last restore verification, from status.verify = { lastAt, lastOk, checked, matched, failed,
+-- detail }. `skipped` is deliberately not a field: skipped = checked - matched - failed, and a
+-- skipped file is one whose live copy legitimately changed or went away, so it proves neither way.
+--
+-- lastOk alone is NOT the verdict: a run that compared nothing publishes lastOk = true (no live file
+-- was blamed) with a detail sentence saying so, and rendering that as "N verified" would be the exact
+-- lie this feature exists to remove. So success is judged on the counts, and a run that proved
+-- nothing shows no verdict word at all -- the counts line and the service's own detail sentence carry
+-- it, in the palette's attention role rather than a success one.
+local function verifyBlock(running)
+  local verify = status.verify
+  local verdict = nil
+  local tone = "on_surface"
+  local counts = nil
+  local failLine = nil
+  local detail = nil
+  local at = nil
+
+  if type(verify) ~= "table" then
+    verdict = tr("panel.label.never_verified")
+    tone = "on_surface/0.6"
+  else
+    at = tonumber(verify.lastAt)
+    local checked = tonumber(verify.checked) or 0
+    local matched = tonumber(verify.matched) or 0
+    local failed = tonumber(verify.failed) or 0
+    if checked == 0 then
+      -- Nothing could be checked at all (no snapshot, a failed listing, a refused target). The
+      -- service reports that as lastOk = false with a reason, and "0 of 0 files matched" would read
+      -- like a pass, so the verdict word carries it and the counts line is left out.
+      verdict = tr("panel.label.failed")
+      tone = "error"
+    elseif failed > 0 then
+      verdict = tr("panel.label.failed")
+      tone = "error"
+    elseif matched == 0 then
+      -- checked > 0 and nothing was compared: every file was skipped. No verdict word -- nothing was
+      -- proven, and neither "ok" nor "failed" would be true.
+      tone = "tertiary"
+    else
+      verdict = tr("panel.label.ok")
+    end
+    if checked > 0 then
+      counts = tr("panel.label.verified_ok", { matched = tostring(matched), checked = tostring(checked) })
+      if failed > 0 then
+        -- Stated as its own line rather than left to the detail sentence below, which is free text
+        -- from the service and may be trimmed in a future version.
+        failLine = tr("panel.label.verified_fail", { failed = tostring(failed), checked = tostring(checked) })
+      end
+    end
+    -- The service's own sentence, shown exactly where the counts cannot explain themselves: nothing
+    -- was checked, something did not match (it names the first mismatch), or nothing was compared.
+    -- A run whose files all matched has its counts line already saying the same thing.
+    local worded = checked == 0 or failed > 0 or matched == 0
+    if worded and type(verify.detail) == "string" and verify.detail ~= "" then
+      detail = verify.detail
+    end
+  end
+
+  local children = {
+    ui.row({ key = "verify-header", gap = 8, align = "center" }, {
+      ui.glyph({ name = "arrow-back-up", size = 13, color = tone }),
+      ui.label({ text = tr("panel.label.last_verified"), color = "on_surface/0.6", fontSize = 12 }),
+      ui.spacer({ flexGrow = 1 }),
+      ui.label({
+        key = "verify-verdict",
+        -- "never verified" is the whole value when there is no result: appending an age ("never ·
+        -- never") would read as two facts where there are none.
+        text = at == nil and verdict
+          or (verdict ~= nil and (agoLabel(at) .. " · " .. verdict) or agoLabel(at)),
+        color = tone,
+        fontSize = 12,
+      }),
+      ui.button({
+        key = "verify-now",
+        text = tr("panel.action.verify"),
+        glyph = "arrow-back-up",
+        variant = "secondary",
+        controlSize = "sm",
+        -- Same gate as the check button (a verification needs restic and a repository), plus the
+        -- in-flight guard every action carries: while a job runs the button is disabled rather than
+        -- hidden, because the last result below it is exactly what the user is looking at.
+        enabled = status.available == true and status.repoConfigured == true and running ~= true,
+        onClick = function()
+          -- No payload: the service derives the scratch target from the configured restore target.
+          send(state.EVENT_VERIFY)
+        end,
+      }),
+    }),
+  }
+  if counts ~= nil then
+    table.insert(children, ui.label({ key = "verify-counts", text = counts, color = tone, fontSize = 12 }))
+  end
+  if failLine ~= nil then
+    table.insert(children, ui.label({ key = "verify-failed", text = failLine, color = tone, fontSize = 12 }))
+  end
+  if detail ~= nil then
+    table.insert(children, ui.label({ key = "verify-detail", text = detail, color = tone, fontSize = 11 }))
+  end
+  return ui.column({ key = "verify-block", gap = 4, padding = 10 }, children)
+end
+
 local function runTab()
   local cfg = config()
   local children = {}
@@ -870,6 +1135,10 @@ local function runTab()
 
   table.insert(children, ui.separator({}))
   table.insert(children, lastRunLine())
+  table.insert(children, checksLine())
+  -- The verification block stays visible while a job runs (with its button disabled): it is the last
+  -- result, and blanking it mid-job would hide the very thing the user opened the tab to read.
+  table.insert(children, verifyBlock(running))
   table.insert(children, ui.label({
     key = "next-run",
     text = tr("panel.run.scheduled", { when = schedule.untilLabel(nowSec(), status.nextRun) }),
