@@ -220,7 +220,8 @@ M.start(argv, opts) -> token, err, paths
   -- paths = { log, status, exit, pid, script, fifo }
 M.poll(token, paths, lastSize)
   -> { done, exitCode, text, statusLine, changed, size }
-M.cancel(paths) -> bool
+M.cancel(paths) -> bool                 -- SIGTERM only; measured insufficient alone, so the
+M.signal(paths, signalName) -> ok, err  -- service escalates: allow-list is "TERM" or "KILL"
 M.readLog(path, maxBytes, maxLines) -> text        -- for the log viewer
 M.sweep(maxAgeMs) -> removed
 M.dataDir(sub) -> dir|nil, err

@@ -118,5 +118,21 @@
   "widget.row.progress": "Progress",
   "widget.row.last_run": "Last run",
   "widget.row.next_run": "Next run",
-  "widget.row.error": "Error"
+  "widget.row.error": "Error",
+  "panel.filter.newest": "Newest first",
+  "panel.filter.oldest": "Oldest first",
+  "panel.label.snapshot_count": "{shown} of {total} snapshots",
+  "panel.label.ago": "{age} ago",
+  "panel.label.installed": "installed",
+  "panel.row.meta": "{host} · {files} files · {size}",
+  "panel.retention.policy": "Keep: {last} last · {daily} daily · {weekly} weekly · {monthly} monthly",
+  "panel.retention.no_policy": "Set at least one keep-* rule in the plugin settings.",
+  "panel.prune.note": "Removal only runs after you confirm below.",
+  "panel.prune.truncated": "removal list truncated to the first {shown} snapshots",
+  "panel.restore.preview_missing": "Preview first: no restore preview is loaded for this snapshot.",
+  "panel.message.copied_id": "Copied snapshot id {id}",
+  "panel.logs.exit": "exit {code}",
+  "panel.diff.header": "Diff {from} → {to}",
+  "panel.diff.counts": "{added} added · {removed} removed · {changed} changed",
+  "panel.diff.no_previous": "No older snapshot to diff against."
 }

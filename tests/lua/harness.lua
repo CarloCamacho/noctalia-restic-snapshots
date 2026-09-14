@@ -162,6 +162,12 @@ function H.install(plugin_dir)
     json = {
       decode = function(text)
         if H.jsonMap[text] ~= nil then return H.jsonMap[text] end
+        -- The real host decodes with a JSON parser, which tolerates surrounding whitespace.
+        -- The canned map is an exact-string lookup, so trim first: otherwise
+        -- parseObject("...}\n") reads as undecodable and a test lies about the host.
+        local trimmed = type(text) == "string"
+          and (text:gsub("^%s+", ""):gsub("%s+$", "")) or text
+        if H.jsonMap[trimmed] ~= nil then return H.jsonMap[trimmed] end
         if type(H.decodeFn) == "function" then return H.decodeFn(text) end
         return nil
       end,

@@ -35,6 +35,12 @@ local KILL_GRACE_SECONDS = 10
 -- retried within about a minute instead of a whole interval later.
 local CATCHUP_DELAY_SECONDS = 30
 
+-- How often update() sweeps finished job files. Sweeping on the lifecycle events alone was not
+-- enough: a long-lived shell kept the files of a finished (or crashed) job indefinitely, and a
+-- persisted log path could outlive the file it points at. Running jobs are protected by the
+-- runner's own pid-liveness check, so an hourly sweep cannot touch a live one.
+local SWEEP_INTERVAL_SECONDS = 3600
+
 -- Bounds for the log the panel shows, matching jobs.readLog's own ceiling.
 local LOG_TAIL_BYTES = 32768
 local LOG_TAIL_LINES = 200
@@ -68,6 +74,7 @@ local staleNotified = false
 local hydrated = false
 local storedNextRunAt = nil
 local armedInterval = nil
+local lastSweepAt = nil
 
 local function nowSec()
   return math.floor(noctalia.nowMs() / 1000)
@@ -1119,6 +1126,13 @@ end
 
 function update()
   pollJob()
+  -- Hourly sweep on top of the enable/exit sweep: finished jobs age out on their own, and a
+  -- job whose script died before writing its exit file stops leaking its files forever.
+  local now = nowSec()
+  if lastSweepAt == nil or now - lastSweepAt >= SWEEP_INTERVAL_SECONDS then
+    lastSweepAt = now
+    jobs.sweep()
+  end
   -- Free: keeps the staleness line honest between refreshes (a shell that slept through the
   -- threshold notices as soon as it wakes, not at the next backup).
   applyStaleness(true)
