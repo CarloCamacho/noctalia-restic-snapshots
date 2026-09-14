@@ -118,6 +118,31 @@ local function bound(limit, fallback)
   return math.floor(value)
 end
 
+-- ── restore verification bounds (0.3.0) ──────────────────────────────────────
+
+-- The largest file one verification reads whole. Comparing two copies means holding both in
+-- memory, and the host's readFile reads a whole file with no bound of its own, so anything bigger
+-- is skipped -- reported as skipped, never as matched.
+M.VERIFY_MAX_BYTES = 4 * 1024 * 1024
+
+-- The range `verify_file_count` is declared with in plugin.toml (min 1, max 25, default 3).
+M.VERIFY_FILES_MIN = 1
+M.VERIFY_FILES_MAX = 25
+M.VERIFY_FILES_DEFAULT = 3
+
+-- Clamp `verify_file_count` into that range, so a hand-edited settings file cannot turn one
+-- verification into a full-snapshot restore.
+local function verifyFileCount(value)
+  local count = math.floor(tonumber(value) or 0)
+  if count < M.VERIFY_FILES_MIN then
+    return M.VERIFY_FILES_DEFAULT
+  end
+  if count > M.VERIFY_FILES_MAX then
+    return M.VERIFY_FILES_MAX
+  end
+  return count
+end
+
 -- ── redaction ────────────────────────────────────────────────────────────────
 
 -- Query parameters whose value is a credential.
@@ -239,6 +264,9 @@ function M.config(settings)
     restoreAllowRoots = allowRoots,
     checkSubset = trim(settings.check_subset) ~= "" and trim(settings.check_subset) or "1/100",
     checkIntervalHours = math.max(0, tonumber(settings.check_interval_hours) or 0),
+    -- Restore verification (0.3.0). 0 hours means off, which is the manifest's default.
+    verifyIntervalHours = math.max(0, tonumber(settings.verify_interval_hours) or 0),
+    verifyFileCount = verifyFileCount(settings.verify_file_count),
     staleAfterHours = math.max(0, tonumber(settings.stale_after_hours) or 0),
     jobTimeoutMinutes = jobTimeout,
     envFile = trim(settings.env_file),
@@ -911,6 +939,198 @@ function M.ageLabel(seconds)
     return string.format("%dh", math.floor(s / 3600))
   end
   return string.format("%dd", math.floor(s / 86400))
+end
+
+-- ── restore verification (0.3.0) ─────────────────────────────────────────────
+-- A verification restores a few files out of the newest snapshot and compares them with the live
+-- files. Everything in this section is pure: WHICH files are chosen, where the scratch copy goes,
+-- and the judgement of one comparison. The I/O stays in service.luau, so the part that decides
+-- "the backup restores" -- the part that must not be self-deceiving -- is testable on its own.
+
+-- A timestamp in epoch seconds. The host reports mtime in seconds (a double, verified in
+-- src/scripting/luau_host.cpp), but a millisecond value is accepted too: the two are told apart by
+-- magnitude (1e11 seconds is the year 5138; 1e11 milliseconds is 1973), so an mtime is never
+-- silently compared against the wrong unit and a changed file is never mistaken for a match.
+function M.mtimeSeconds(value)
+  local n = tonumber(value)
+  if n == nil or n <= 0 then
+    return nil
+  end
+  if n >= 1e11 then
+    return math.floor(n / 1000)
+  end
+  return math.floor(n)
+end
+
+-- The newest snapshot in a list of rows, with its time as epoch seconds. Rows whose time cannot be
+-- read, or whose id is not a real snapshot id, are never chosen: verifying against a snapshot
+-- whose age is unknown would make every "modified after the snapshot" comparison meaningless.
+function M.newestSnapshot(rows)
+  local best = nil
+  local bestAt = nil
+  for _, row in ipairs(asList(rows)) do
+    if type(row) == "table" and M.validSnapshotId(row.id) then
+      local at = M.epochFromRfc3339(row.time)
+      if at ~= nil and (bestAt == nil or at > bestAt) then
+        best = row
+        bestAt = at
+      end
+    end
+  end
+  if best == nil then
+    return nil
+  end
+  return { id = best.id, time = best.time, at = bestAt, shortId = best.shortId }
+end
+
+-- The scratch directory one verification writes into. Kept inside the configured restore target so
+-- the existing allow-list (validRestoreTarget) still owns every write path, and epoch-stamped so
+-- two verifications can never collide -- an earlier run's leftovers (see the cleanup note in
+-- service.luau: the host cannot remove directories) cannot make the next one fail.
+-- A trailing slash (a user typing it into the settings) is dropped so the path restic is handed is
+-- a clean one; a base that reduces to nothing is refused rather than guessed at.
+function M.verifyTarget(base, at)
+  local root = expandPath(base):gsub("/+$", "")
+  local stamp = math.floor(tonumber(at) or 0)
+  if root == "" or stamp <= 0 then
+    return nil
+  end
+  return root .. "/.verify/" .. tostring(stamp)
+end
+
+-- Choose the files to verify out of what `restic ls --json` returned (post-parseLs entries).
+--
+-- * regular files only (`type == "file"`): a directory or a symlink has nothing to compare;
+-- * nothing larger than maxBytes, because the comparison reads both copies whole;
+-- * files with content are preferred -- comparing two zero-byte files proves nothing -- but a
+--   snapshot of only empty files still verifies rather than reporting "no usable files";
+-- * deterministic for a given listing, and spread across it: the picks are evenly spaced, so the
+--   same snapshot always verifies the same files and consecutive verifications of a growing
+--   snapshot do not all land on the first few paths.
+--
+-- Returns { files = { { path, size }, ... }, wanted, available, skippedEmpty, skippedLarge }.
+-- `available` counts the regular files the listing offered, so a caller can tell "the snapshot has
+-- three files and we checked three" from "the snapshot has 4000 files and we checked three".
+function M.selectVerifyFiles(entries, count, maxBytes)
+  local want = verifyFileCount(count)
+  local limit = tonumber(maxBytes)
+  if limit == nil or limit <= 0 then
+    limit = M.VERIFY_MAX_BYTES
+  end
+  local usable = {}
+  local withContent = {}
+  local skippedEmpty = 0
+  local skippedLarge = 0
+  for _, entry in ipairs(asList(entries)) do
+    if type(entry) == "table" and entry.type == "file" then
+      local path = entry.path
+      local bytes = tonumber(entry.size)
+      -- An absolute path is the only kind that can be compared with a live file; a flag-shaped or
+      -- relative one is not a path restic will restore where we would look for it.
+      if type(path) == "string" and path:sub(1, 1) == "/" and bytes ~= nil then
+        if bytes <= 0 then
+          skippedEmpty = skippedEmpty + 1
+          table.insert(usable, { path = path, size = bytes })
+        elseif bytes > limit then
+          skippedLarge = skippedLarge + 1
+        else
+          table.insert(usable, { path = path, size = bytes })
+          table.insert(withContent, { path = path, size = bytes })
+        end
+      end
+    end
+  end
+  -- Prefer files that have content, but never refuse to verify just because a snapshot holds only
+  -- empty ones.
+  local pool = #withContent >= want and withContent or usable
+  local total = #pool
+  local picks = want < total and want or total
+  local files = {}
+  for i = 1, picks do
+    local index = math.floor((i - 0.5) * total / picks) + 1
+    table.insert(files, pool[index])
+  end
+  return {
+    files = files,
+    wanted = want,
+    available = total,
+    skippedEmpty = skippedEmpty,
+    skippedLarge = skippedLarge,
+  }
+end
+
+-- The `--include` patterns for a verification: one per chosen file, absolute only, bounded. A
+-- relative entry is dropped rather than guessed at (dropping can only verify less, never more).
+-- NOTE: restic matches these as patterns. A path containing glob metacharacters can therefore
+-- over- or under-match, which fails closed here: the restore produces no copy for that file and
+-- the verification reports it as a failure instead of a match.
+function M.verifyIncludes(files)
+  local out = {}
+  for _, entry in ipairs(asList(files)) do
+    local path = type(entry) == "table" and entry.path or entry
+    if type(path) == "string" and path:sub(1, 1) == "/" and #out < M.VERIFY_FILES_MAX then
+      table.insert(out, path)
+    end
+  end
+  return out
+end
+
+-- The argv for the restore half of a verification. It delegates to restoreArgs so the argv order
+-- and the id/target validation cannot drift from the user-facing restore, and refuses an empty
+-- file set: a "restore" of nothing would publish a meaningless success.
+function M.verifyRestoreArgs(cfg, binPath, snapshot, target, files)
+  local includes = M.verifyIncludes(files)
+  if #includes == 0 then
+    return nil, "no files to verify"
+  end
+  return M.restoreArgs(cfg, binPath, snapshot, target, includes, { dryRun = false })
+end
+
+-- The judgement for one file: what the restore wrote against what is live now.
+--
+--   restored = { read = <bool>, text = <string|nil> }   the copy restic restored
+--   live     = { exists, isFile, read, text, mtime, size }  the live file, as observed
+--   opts     = { snapshotAt = <epoch|nil>, maxBytes = <n> }
+--
+-- Outcomes, and why each one is honest:
+--   "matched"  the live file exists and holds exactly the restored bytes.
+--   "failed"   the live file exists, differs, and could not legitimately have changed since the
+--              snapshot: the backup disagrees with reality. A restore that produced no readable
+--              copy is a failure too -- "we could not read the archive back" is the exact thing
+--              this feature exists to detect, and calling it a skip would be self-deception.
+--   "skipped"  nothing can be proven about this file for a reason that is not the backup's fault:
+--              the live file is gone, it was legitimately modified after the snapshot, it is too
+--              large to compare in this runtime, or it could not be read.
+--
+-- An unknown snapshot time (snapshotAt == nil) deliberately excuses nothing: with no timestamp to
+-- compare against, a difference is reported rather than explained away.
+function M.verifyOutcome(restored, live, opts)
+  restored = restored or {}
+  live = live or {}
+  opts = opts or {}
+  if restored.read ~= true or type(restored.text) ~= "string" then
+    return { status = "failed", reason = "the restore produced no readable copy" }
+  end
+  if live.exists ~= true or live.isFile ~= true then
+    return { status = "skipped", reason = "the live file is gone" }
+  end
+  local snapshotAt = tonumber(opts.snapshotAt)
+  local mtime = tonumber(live.mtime)
+  if snapshotAt ~= nil and mtime ~= nil and mtime > snapshotAt then
+    return { status = "skipped", reason = "the live file changed after the snapshot" }
+  end
+  local maxBytes = tonumber(opts.maxBytes) or M.VERIFY_MAX_BYTES
+  local size = tonumber(live.size)
+  if size ~= nil and size > maxBytes then
+    return { status = "skipped", reason = "the live file is too large to compare" }
+  end
+  if live.read ~= true or type(live.text) ~= "string" then
+    return { status = "skipped", reason = "the live file could not be read" }
+  end
+  if live.text == restored.text then
+    return { status = "matched" }
+  end
+  return { status = "failed", reason = "the backup does not match the live file" }
 end
 
 return M

@@ -14,6 +14,11 @@ The parsers are asserted in `tests/lua/restic_pure_test.lua`, against verbatim r
 output captured on this machine (the parsers need a real JSON decoder, which the python side has
 no access to).
 
+The restore-verification helpers (0.3.0: which files to verify, where the scratch copy goes, and
+the judgement of one comparison) are pure by design and are cross-checked here the same way the
+argv builders are: the python mirror computes the expectation and the Lua driver prints what the
+real library decided.
+
 Run from the repo root:  python3 -m unittest discover -s tests
 """
 
@@ -73,7 +78,32 @@ SETTINGS = {
     "restore_target": "/home/tester/restore",
     "restore_allow_roots": ["/srv/staging"],
     "check_subset": "1/100",
+    "verify_interval_hours": 6,
+    "verify_file_count": 5,
 }
+
+# The listing a verification chooses from: regular files, a directory and a symlink without a size,
+# an empty file, a file past the comparison bound, and a relative path that is not a path to
+# compare with a live file. Mirrors what `restic ls --json` produces (parseLs entries).
+VERIFY_ENTRIES = [
+    {"name": "a", "type": "file", "path": "/data/a", "size": 10},
+    {"name": "b", "type": "dir", "path": "/data/b"},
+    {"name": "c", "type": "file", "path": "/data/c", "size": 0},
+    {"name": "d", "type": "symlink", "path": "/data/d"},
+    {"name": "e", "type": "file", "path": "/data/e", "size": 20},
+    {"name": "f", "type": "file", "path": "/data/f", "size": 30},
+    {"name": "g", "type": "file", "path": "/data/g", "size": 40},
+    {"name": "h", "type": "file", "path": "/data/h", "size": 50},
+    {"name": "i", "type": "file", "path": "/data/i", "size": 60},
+    {"name": "j", "type": "file", "path": "/data/j", "size": 70},
+    {"name": "k", "type": "file", "path": "/data/k", "size": 8 * 1024 * 1024},
+    {"name": "l", "type": "file", "path": "relative/l", "size": 5},
+]
+
+VERIFY_MAX_BYTES = 4 * 1024 * 1024
+VERIFY_FILES_MIN = 1
+VERIFY_FILES_MAX = 25
+VERIFY_FILES_DEFAULT = 3
 
 
 def settings(**overrides):
@@ -182,6 +212,76 @@ def human_bytes(value):
     return f"{int(n)} {units[index]}" if index == 0 else f"{n:.1f} {units[index]}"
 
 
+# ── the python mirror of the restore-verification helpers (0.3.0) ────────────
+# Same contract as the argv mirror above: an expectation computed here, cross-checked against what
+# the real lib/restic.luau decides (the Lua driver emits it).
+
+
+def verify_file_count(value):
+    """M.config's clamp of verify_file_count (plugin.toml: min 1, max 25, default 3)."""
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        count = 0
+    if count < VERIFY_FILES_MIN:
+        return VERIFY_FILES_DEFAULT
+    if count > VERIFY_FILES_MAX:
+        return VERIFY_FILES_MAX
+    return count
+
+
+def select_verify_files(entries, count, max_bytes=None):
+    """M.selectVerifyFiles: regular files only, under the bound, spread evenly, content preferred."""
+    want = verify_file_count(count)
+    limit = max_bytes if isinstance(max_bytes, (int, float)) and max_bytes > 0 else VERIFY_MAX_BYTES
+    usable, with_content = [], []
+    skipped_empty = skipped_large = 0
+    for entry in entries or []:
+        if entry.get("type") != "file":
+            continue
+        path, size = entry.get("path"), entry.get("size")
+        if not isinstance(path, str) or not path.startswith("/") or size is None:
+            continue
+        if size <= 0:
+            skipped_empty += 1
+            usable.append({"path": path, "size": size})
+        elif size > limit:
+            skipped_large += 1
+        else:
+            usable.append({"path": path, "size": size})
+            with_content.append({"path": path, "size": size})
+    pool = with_content if len(with_content) >= want else usable
+    total = len(pool)
+    picks = min(want, total)
+    # Lua's index is math.floor((i - 0.5) * total / picks) + 1 (one-based)
+    files = [pool[int((i - 0.5) * total / picks)] for i in range(1, picks + 1)]
+    return {"files": files, "wanted": want, "available": total,
+            "skippedEmpty": skipped_empty, "skippedLarge": skipped_large}
+
+
+def verify_target(base, at):
+    """M.verifyTarget: <restoreTarget>/.verify/<epoch>, or nothing when either part is unusable."""
+    if not isinstance(base, str) or base == "":
+        return None
+    if not isinstance(at, (int, float)) or int(at) <= 0:
+        return None
+    return f"{base.rstrip('/')}/.verify/{int(at)}"
+
+
+def mtime_seconds(value):
+    """M.mtimeSeconds: epoch seconds; a millisecond value is recognised by magnitude."""
+    if isinstance(value, str):
+        try:
+            value = float(value)
+        except ValueError:
+            return None
+    if not isinstance(value, (int, float)) or isinstance(value, bool) or value <= 0:
+        return None
+    if value >= 1e11:
+        return int(value / 1000)
+    return int(value)
+
+
 # ── the Lua driver: the real library, driven through the test harness ─────────
 
 LUA_DRIVER = r"""
@@ -226,11 +326,150 @@ emitArgv("ls_bad_id", restic.lsArgs(cfg, BIN, "-x"))
 emitArgv("init", restic.initArgs(cfg, BIN))
 emitArgv("unlock", restic.unlockArgs(cfg, BIN))
 
+-- ── restore verification (0.3.0) ─────────────────────────────────────────────
+
+local verifyEntries = %(verify_entries)s
+
+local function emitSelection(name, pick)
+  local paths = {}
+  for _, file in ipairs(pick.files) do
+    table.insert(paths, file.path .. ":" .. tostring(file.size))
+  end
+  emit("SELECT", name, table.concat(paths, " ") .. "\0" .. tostring(pick.wanted) .. "\0"
+    .. tostring(pick.available) .. "\0" .. tostring(pick.skippedEmpty) .. "\0"
+    .. tostring(pick.skippedLarge))
+end
+
+emitSelection("default3", restic.selectVerifyFiles(verifyEntries, 3))
+emitSelection("count1", restic.selectVerifyFiles(verifyEntries, 1))
+emitSelection("count25", restic.selectVerifyFiles(verifyEntries, 25))
+emitSelection("count0", restic.selectVerifyFiles(verifyEntries, 0))
+emitSelection("count_nil", restic.selectVerifyFiles(verifyEntries, nil))
+emitSelection("count99", restic.selectVerifyFiles(verifyEntries, 99))
+emitSelection("tiny_bound", restic.selectVerifyFiles(verifyEntries, 3, 15))
+emitSelection("bound_zero", restic.selectVerifyFiles(verifyEntries, 3, 0))
+emitSelection("only_empty", restic.selectVerifyFiles({ { type = "file", path = "/data/c", size = 0 } }, 2))
+emitSelection("no_files", restic.selectVerifyFiles({ { type = "dir", path = "/data/b" } }, 3))
+emitSelection("no_entries", restic.selectVerifyFiles(nil, 3))
+
+-- the settings clamp, straight out of M.config
+emit("VERIFY", "max_bytes", restic.VERIFY_MAX_BYTES)
+emit("VERIFY", "files_min", restic.VERIFY_FILES_MIN)
+emit("VERIFY", "files_max", restic.VERIFY_FILES_MAX)
+emit("VERIFY", "files_default", restic.VERIFY_FILES_DEFAULT)
+emit("VERIFY", "count_nil", restic.config({}).verifyFileCount)
+emit("VERIFY", "count_zero", restic.config({ verify_file_count = 0 }).verifyFileCount)
+emit("VERIFY", "count_negative", restic.config({ verify_file_count = -5 }).verifyFileCount)
+emit("VERIFY", "count_over", restic.config({ verify_file_count = 99 }).verifyFileCount)
+emit("VERIFY", "count_string", restic.config({ verify_file_count = "4" }).verifyFileCount)
+emit("VERIFY", "count_float", restic.config({ verify_file_count = 3.9 }).verifyFileCount)
+emit("VERIFY", "interval_nil", restic.config({}).verifyIntervalHours)
+emit("VERIFY", "interval_negative", restic.config({ verify_interval_hours = -3 }).verifyIntervalHours)
+emit("VERIFY", "interval_string", restic.config({ verify_interval_hours = "6" }).verifyIntervalHours)
+
+-- where the scratch copy goes
+local function emitTarget(name, value)
+  emit("VERIFY_TARGET", name, value == nil and "NIL" or value)
+end
+emitTarget("ok", restic.verifyTarget("/home/tester/restore", 1788874602))
+emitTarget("trailing_slash", restic.verifyTarget("/home/tester/restore/", 7))
+emitTarget("no_time", restic.verifyTarget("/home/tester/restore", nil))
+emitTarget("zero_time", restic.verifyTarget("/home/tester/restore", 0))
+emitTarget("no_base", restic.verifyTarget(nil, 1788874602))
+
+-- the include list restic is handed: absolute paths only, one --include each, never a dry run
+emitArgv("verify_restore", restic.verifyRestoreArgs(cfg, BIN, "%(id1)s",
+  "/home/tester/restore/.verify/1788874602", {
+    { path = "/home/tester/docs/a b" },
+    { path = "/home/tester/docs/c" },
+    { path = "relative/x" },
+  }))
+emitArgv("verify_restore_strings", restic.verifyRestoreArgs(cfg, BIN, "%(id1)s",
+  "/home/tester/restore/.verify/1", { "/home/tester/docs/a", "relative/x" }))
+emitArgv("verify_restore_none", restic.verifyRestoreArgs(cfg, BIN, "%(id1)s",
+  "/home/tester/restore/.verify/1", {}))
+emitArgv("verify_restore_bad_id", restic.verifyRestoreArgs(cfg, BIN, "latest",
+  "/home/tester/restore/.verify/1", { "/home/tester/docs/a" }))
+
+-- mtimes: seconds and milliseconds must never be confused
+emit("MTIME", "seconds", tostring(restic.mtimeSeconds(1788874602)))
+emit("MTIME", "float_seconds", tostring(restic.mtimeSeconds(1788874602.75)))
+emit("MTIME", "milliseconds", tostring(restic.mtimeSeconds(1788874602000)))
+emit("MTIME", "zero", tostring(restic.mtimeSeconds(0)))
+emit("MTIME", "negative", tostring(restic.mtimeSeconds(-5)))
+emit("MTIME", "nil", tostring(restic.mtimeSeconds(nil)))
+emit("MTIME", "string", tostring(restic.mtimeSeconds("1788874602")))
+
+-- the newest snapshot: invalid ids and unreadable times are never chosen
+local newestRows = {
+  { id = "aaaaaaaa", time = "2026-09-08T03:36:42+00:00" },
+  { id = "not-hex", time = "2026-09-08T13:35:42+00:00" },
+  { id = "bbbbbbbb", time = "2026-09-08T13:35:42+00:00" },
+  { id = "cccccccc", time = "no timestamp here" },
+}
+local newest = restic.newestSnapshot(newestRows)
+emit("NEWEST", "picks_the_newest_valid_row",
+  tostring(newest ~= nil and newest.id or "NIL") .. "\0"
+    .. tostring(newest ~= nil and newest.at or "NIL"))
+emit("NEWEST", "empty", tostring(restic.newestSnapshot({}) == nil))
+emit("NEWEST", "no_valid_row", tostring(
+  restic.newestSnapshot({ { id = "zzz", time = "2026-09-08T13:35:42+00:00" } }) == nil))
+emit("NEWEST", "nil_rows", tostring(restic.newestSnapshot(nil) == nil))
+
+-- the judgement for one file: matched / failed / skipped, and why
+local snapshotAt = 1788874542
+local outcomeCases = {
+  { "matched", { read = true, text = "same" },
+    { exists = true, isFile = true, read = true, text = "same", mtime = snapshotAt - 60, size = 4 },
+    { snapshotAt = snapshotAt } },
+  { "failed_differs", { read = true, text = "snapshot" },
+    { exists = true, isFile = true, read = true, text = "live", mtime = snapshotAt - 60, size = 4 },
+    { snapshotAt = snapshotAt } },
+  { "failed_unknown_snapshot_time", { read = true, text = "snapshot" },
+    { exists = true, isFile = true, read = true, text = "live", mtime = snapshotAt - 60, size = 4 },
+    { snapshotAt = nil } },
+  { "failed_unknown_mtime", { read = true, text = "snapshot" },
+    { exists = true, isFile = true, read = true, text = "live", mtime = nil, size = 4 },
+    { snapshotAt = snapshotAt } },
+  { "skipped_changed_wins_over_too_large", { read = true, text = "snapshot" },
+    { exists = true, isFile = true, read = true, text = "live", mtime = snapshotAt + 60, size = 4 },
+    { snapshotAt = snapshotAt, maxBytes = 100 } },
+  { "skipped_changed_after", { read = true, text = "snapshot" },
+    { exists = true, isFile = true, read = true, text = "live", mtime = snapshotAt + 60, size = 4 },
+    { snapshotAt = snapshotAt } },
+  { "skipped_changed_even_if_identical", { read = true, text = "same" },
+    { exists = true, isFile = true, read = true, text = "same", mtime = snapshotAt + 60, size = 4 },
+    { snapshotAt = snapshotAt } },
+  { "skipped_gone", { read = true, text = "snapshot" },
+    { exists = false, isFile = false, read = false, mtime = nil, size = nil },
+    { snapshotAt = snapshotAt } },
+  { "skipped_replaced_by_a_directory", { read = true, text = "snapshot" },
+    { exists = true, isFile = false, read = false, mtime = snapshotAt, size = 0 },
+    { snapshotAt = snapshotAt } },
+  { "skipped_too_large", { read = true, text = "snapshot" },
+    { exists = true, isFile = true, read = false, mtime = snapshotAt - 60, size = 10 },
+    { snapshotAt = snapshotAt, maxBytes = 5 } },
+  { "skipped_unreadable", { read = true, text = "snapshot" },
+    { exists = true, isFile = true, read = false, mtime = snapshotAt - 60, size = 4 },
+    { snapshotAt = snapshotAt } },
+  { "failed_no_restored_copy", { read = false },
+    { exists = true, isFile = true, read = true, text = "live", mtime = snapshotAt - 60, size = 4 },
+    { snapshotAt = snapshotAt } },
+  { "failed_restored_without_text", { read = true },
+    { exists = true, isFile = true, read = true, text = "live", mtime = snapshotAt - 60, size = 4 },
+    { snapshotAt = snapshotAt } },
+}
+
+for _, case in ipairs(outcomeCases) do
+  local outcome = restic.verifyOutcome(case[2], case[3], case[4])
+  emit("OUTCOME", case[1], tostring(outcome.status) .. "\0" .. tostring(outcome.reason))
+end
+
 -- config shape: every frozen key, with its value
 local frozen = { "bin", "repository", "redactedRepository", "passwordFile", "paths", "tags",
   "excludeFile", "mode", "intervalMinutes", "keepLast", "keepDaily", "keepWeekly", "keepMonthly",
   "restoreTarget", "restoreAllowRoots", "checkSubset", "checkIntervalHours", "staleAfterHours",
-  "jobTimeoutMinutes", "envFile" }
+  "jobTimeoutMinutes", "envFile", "verifyIntervalHours", "verifyFileCount" }
 for _, key in ipairs(frozen) do
   local value = cfg[key]
   if value == nil then
@@ -313,6 +552,9 @@ def lua_literal(value):
         return repr(value)
     if isinstance(value, list):
         return "{" + ", ".join(lua_literal(item) for item in value) + "}"
+    if isinstance(value, dict):
+        body = ", ".join(f"{key} = {lua_literal(item)}" for key, item in sorted(value.items()))
+        return "{" + body + "}"
     raise TypeError(f"unsupported setting type: {type(value)!r}")
 
 
@@ -335,6 +577,7 @@ class TestLuaLibrary(unittest.TestCase):
             "restore_target": cfg["restore_target"],
             "id1": SNAPSHOT_ID,
             "id2": SNAPSHOT_ID_2,
+            "verify_entries": lua_literal(VERIFY_ENTRIES),
         }
         cls.driver = tempfile.NamedTemporaryFile("w", suffix=".lua", delete=False)
         cls.driver.write(source)
@@ -350,6 +593,12 @@ class TestLuaLibrary(unittest.TestCase):
         cls.redact_again = {}
         cls.valid = {}
         cls.target = {}
+        cls.selection = {}
+        cls.verify = {}
+        cls.verify_target = {}
+        cls.outcome = {}
+        cls.mtime = {}
+        cls.newest = {}
         cls.errors = {}
         cls.output = result.stdout.decode()
         for line in cls.output.splitlines():
@@ -375,6 +624,36 @@ class TestLuaLibrary(unittest.TestCase):
             elif kind == "TARGET":
                 ok, err = value.split("\0", 1)
                 cls.target[name] = (ok == "true", err)
+            elif kind == "SELECT":
+                paths, wanted, available, empty, large = value.split("\0")
+                files = []
+                for item in paths.split(" "):
+                    if item:
+                        path, size = item.rsplit(":", 1)
+                        files.append({"path": path, "size": int(size)})
+                cls.selection[name] = {
+                    "files": files,
+                    "wanted": int(wanted),
+                    "available": int(available),
+                    "skippedEmpty": int(empty),
+                    "skippedLarge": int(large),
+                }
+            elif kind == "VERIFY":
+                cls.verify[name] = value
+            elif kind == "VERIFY_TARGET":
+                cls.verify_target[name] = None if value == "NIL" else value
+            elif kind == "OUTCOME":
+                outcome_status, outcome_reason = value.split("\0", 1)
+                cls.outcome[name] = (outcome_status, outcome_reason)
+            elif kind == "MTIME":
+                cls.mtime[name] = None if value == "nil" else int(value)
+            elif kind == "NEWEST":
+                parts = value.split("\0")
+                if len(parts) == 1:
+                    cls.newest[name] = parts[0] == "true"
+                else:
+                    cls.newest[name] = (None if parts[0] == "NIL" else parts[0],
+                                        None if parts[1] == "NIL" else int(parts[1]))
 
     @classmethod
     def tearDownClass(cls):
@@ -538,6 +817,135 @@ class TestLuaLibrary(unittest.TestCase):
         self.assertIn("must be inside", self.target["sibling_prefix"][1])
         self.assertIn("must be inside", self.target["prefix_only"][1])
 
+    # ── restore verification (0.3.0) ─────────────────────────────────────────
+
+    def test_verification_bounds_match_the_manifest(self):
+        self.assertEqual(int(self.verify["max_bytes"]), VERIFY_MAX_BYTES)
+        self.assertEqual(int(self.verify["files_min"]), VERIFY_FILES_MIN)
+        self.assertEqual(int(self.verify["files_max"]), VERIFY_FILES_MAX)
+        self.assertEqual(int(self.verify["files_default"]), VERIFY_FILES_DEFAULT)
+
+    def test_verify_settings_are_read_and_clamped(self):
+        self.assertEqual(self.config["verifyIntervalHours"], str(self.cfg["verify_interval_hours"]))
+        self.assertEqual(self.config["verifyFileCount"], str(self.cfg["verify_file_count"]))
+        for name, raw, expected in (("count_nil", None, 3), ("count_zero", 0, 3),
+                                    ("count_negative", -5, 3), ("count_over", 99, 25),
+                                    ("count_string", "4", 4), ("count_float", 3.9, 3)):
+            self.assertEqual(int(self.verify[name]), expected, name)
+            self.assertEqual(verify_file_count(raw), expected, name)
+        # a verification interval is never negative, and a string setting is honoured
+        self.assertEqual(int(self.verify["interval_nil"]), 0)
+        self.assertEqual(int(self.verify["interval_negative"]), 0)
+        self.assertEqual(int(self.verify["interval_string"]), 6)
+
+    def test_file_selection_matches_the_mirror(self):
+        cases = {
+            "default3": (VERIFY_ENTRIES, 3, None),
+            "count1": (VERIFY_ENTRIES, 1, None),
+            "count25": (VERIFY_ENTRIES, 25, None),
+            "count0": (VERIFY_ENTRIES, 0, None),
+            "count_nil": (VERIFY_ENTRIES, None, None),
+            "count99": (VERIFY_ENTRIES, 99, None),
+            "tiny_bound": (VERIFY_ENTRIES, 3, 15),
+            "bound_zero": (VERIFY_ENTRIES, 3, 0),
+            "only_empty": ([{"type": "file", "path": "/data/c", "size": 0}], 2, None),
+            "no_files": ([{"type": "dir", "path": "/data/b"}], 3, None),
+            "no_entries": (None, 3, None),
+        }
+        self.assertEqual(set(self.selection), set(cases))
+        for name, (entries, count, max_bytes) in cases.items():
+            self.assertEqual(self.selection[name], select_verify_files(entries, count, max_bytes),
+                             name)
+
+    def test_file_selection_rules(self):
+        picked = self.selection["default3"]
+        # deterministic and spread: 7 candidates, 3 picks, evenly spaced through the listing
+        self.assertEqual([f["path"] for f in picked["files"]],
+                         ["/data/e", "/data/g", "/data/i"])
+        self.assertEqual(picked["available"], 7)
+        self.assertEqual(picked["skippedEmpty"], 1)
+        self.assertEqual(picked["skippedLarge"], 1)
+        self.assertTrue(all(f["size"] > 0 for f in picked["files"]),
+                        "a verification must prefer files with content")
+        self.assertTrue(all(f["size"] <= VERIFY_MAX_BYTES for f in picked["files"]))
+        # never a directory, a symlink, a relative path or a file past the comparison bound
+        for name in ("default3", "count25", "count99"):
+            paths = [f["path"] for f in self.selection[name]["files"]]
+            for refused in ("/data/b", "/data/d", "relative/l", "/data/k"):
+                self.assertNotIn(refused, paths, name)
+        # an empty repository of usable files is reported as such, not as a match
+        self.assertEqual(self.selection["no_files"]["files"], [])
+        self.assertEqual(self.selection["no_entries"]["files"], [])
+        # a snapshot of only empty files still verifies rather than refusing
+        self.assertEqual(self.selection["only_empty"]["files"], [{"path": "/data/c", "size": 0}])
+        self.assertEqual(self.selection["count99"]["wanted"], VERIFY_FILES_MAX)
+        # a tighter bound leaves fewer candidates and says how many it dropped
+        self.assertEqual(self.selection["tiny_bound"]["skippedLarge"], 7)
+        self.assertEqual(self.selection["bound_zero"]["files"], picked["files"])
+
+    def test_judgement_of_one_file(self):
+        expected = {
+            "matched": ("matched", None),
+            "failed_differs": ("failed", "does not match"),
+            "failed_unknown_snapshot_time": ("failed", "does not match"),
+            "failed_unknown_mtime": ("failed", "does not match"),
+            "skipped_changed_wins_over_too_large": ("skipped", "changed after the snapshot"),
+            "skipped_changed_after": ("skipped", "changed after the snapshot"),
+            "skipped_changed_even_if_identical": ("skipped", "changed after the snapshot"),
+            "skipped_gone": ("skipped", "is gone"),
+            "skipped_replaced_by_a_directory": ("skipped", "is gone"),
+            "skipped_too_large": ("skipped", "too large"),
+            "skipped_unreadable": ("skipped", "could not be read"),
+            "failed_no_restored_copy": ("failed", "no readable copy"),
+            "failed_restored_without_text": ("failed", "no readable copy"),
+        }
+        self.assertEqual(set(self.outcome), set(expected))
+        for name, (status, needle) in expected.items():
+            actual, reason = self.outcome[name]
+            self.assertEqual(actual, status, name)
+            self.assertIn(actual, ("matched", "failed", "skipped"), name)
+            if needle is not None:
+                self.assertIn(needle, reason, name)
+        # a difference is a failure even with nothing to compare the age against
+        self.assertEqual(self.outcome["failed_unknown_snapshot_time"][0], "failed")
+        self.assertEqual(self.outcome["failed_unknown_mtime"][0], "failed")
+        # and a restore that produced nothing readable is a failure, never a skip
+        self.assertEqual(self.outcome["failed_no_restored_copy"][0], "failed")
+
+    def test_scratch_directory_is_inside_the_restore_target(self):
+        self.assertEqual(self.verify_target["ok"], verify_target("/home/tester/restore", 1788874602))
+        self.assertEqual(self.verify_target["ok"], "/home/tester/restore/.verify/1788874602")
+        self.assertEqual(self.verify_target["trailing_slash"], "/home/tester/restore/.verify/7")
+        for refused in ("no_time", "zero_time", "no_base"):
+            self.assertIsNone(self.verify_target[refused], refused)
+
+    def test_verify_restore_argv_is_a_plain_restore_of_the_chosen_files(self):
+        target = "/home/tester/restore/.verify/1788874602"
+        self.assert_argv("verify_restore", restore_args(
+            self.cfg, SNAPSHOT_ID, target, ["/home/tester/docs/a b", "/home/tester/docs/c"]))
+        self.assertNotIn("--dry-run", self.argv["verify_restore"])
+        self.assertNotIn("relative/x", self.argv["verify_restore"])
+        self.assert_argv("verify_restore_strings", restore_args(
+            self.cfg, SNAPSHOT_ID, "/home/tester/restore/.verify/1", ["/home/tester/docs/a"]))
+        # an empty file set is refused rather than restoring nothing and calling it a success
+        self.assertNotIn("verify_restore_none", self.argv)
+        self.assertEqual(self.errors["verify_restore_none"], "no files to verify")
+        self.assertNotIn("verify_restore_bad_id", self.argv)
+
+    def test_mtime_units_are_never_confused(self):
+        for name, raw in (("seconds", 1788874602), ("float_seconds", 1788874602.75),
+                          ("milliseconds", 1788874602000), ("zero", 0), ("negative", -5),
+                          ("nil", None), ("string", "1788874602")):
+            self.assertEqual(self.mtime[name], mtime_seconds(raw), name)
+        self.assertEqual(self.mtime["milliseconds"], self.mtime["seconds"])
+        self.assertIsNone(self.mtime["zero"])
+
+    def test_newest_snapshot_skips_rows_that_cannot_be_used(self):
+        self.assertEqual(self.newest["picks_the_newest_valid_row"], ("bbbbbbbb", 1788874542))
+        self.assertTrue(self.newest["empty"])
+        self.assertTrue(self.newest["no_valid_row"])
+        self.assertTrue(self.newest["nil_rows"])
+
 
 class TestQuoting(unittest.TestCase):
     def test_round_trip_preserves_bytes(self):
@@ -632,8 +1040,27 @@ class TestLibrarySource(unittest.TestCase):
                      "lastSummary", "lastStatusLine", "parseSnapshots", "parseObject", "parseStats",
                      "parseLs", "parseDiff", "snapshotRow", "snapshotSummary", "summariseForgetDry",
                      "filterSnapshots", "validSnapshotId", "validRestoreTarget", "redactRepository",
-                     "humanBytes", "ageLabel", "shellQuote", "shellArgv"):
+                     "humanBytes", "ageLabel", "shellQuote", "shellArgv",
+                     # 0.3.0 restore verification
+                     "mtimeSeconds", "newestSnapshot", "verifyTarget", "selectVerifyFiles",
+                     "verifyIncludes", "verifyRestoreArgs", "verifyOutcome"):
             self.assertIn(f"function M.{name}(", self.source, name)
+
+    def test_verification_helpers_are_pure_and_bounded(self):
+        # the judgement itself must not do I/O: the service owns the reads, so the part that
+        # decides "the backup restores" stays testable (and cannot quietly read a live file)
+        for name in ("selectVerifyFiles", "verifyOutcome", "verifyTarget", "newestSnapshot"):
+            body = self.function_body(name)
+            for forbidden in ("noctalia.", "os.", "io."):
+                self.assertNotIn(forbidden, body, f"{name} must stay pure")
+
+    def test_verification_never_uses_a_shell_or_a_credential(self):
+        for name in ("verifyRestoreArgs", "verifyIncludes"):
+            body = self.function_body(name)
+            self.assertNotIn("shell", body, name)
+            self.assertNotIn("password", body, name)
+        # the restore half is built by the same builder the user-facing restore uses
+        self.assertIn("restoreArgs", self.function_body("verifyRestoreArgs"))
 
     def test_read_only_builders_go_through_the_no_lock_helper(self):
         for name in ("snapshotsArgs", "statsArgs", "lsArgs", "diffArgs"):

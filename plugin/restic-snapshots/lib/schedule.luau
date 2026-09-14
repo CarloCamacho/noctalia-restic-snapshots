@@ -87,6 +87,25 @@ function M.checkDue(nowSec, lastCheckAt, intervalHours)
   return tonumber(nowSec) >= last + interval * 3600
 end
 
+-- ── restore verification ─────────────────────────────────────────────────────
+
+-- True when a restore verification is due. Mirrors checkDue exactly: an interval of 0 (the
+-- manifest's default) means off, and a verification that has never run is due, so turning the
+-- setting on takes effect instead of waiting out a whole interval. The caller stamps
+-- `lastVerifyAt` on every attempt -- including a failed one -- so a repository that keeps failing
+-- is checked on the interval, never on every tick.
+function M.verifyDue(nowSec, lastVerifyAt, intervalHours)
+  local interval = tonumber(intervalHours)
+  if interval == nil or interval <= 0 then
+    return false
+  end
+  local last = tonumber(lastVerifyAt)
+  if last == nil then
+    return true
+  end
+  return tonumber(nowSec) >= last + interval * 3600
+end
+
 -- The `--read-data-subset` value for one slot of the rotation. `index` is a zero-based counter
 -- that wraps, so the series walks 1/total, 2/total ... total/total, 1/total ... and every part
 -- of the repository is read over time without ever reading all of it in one run.
