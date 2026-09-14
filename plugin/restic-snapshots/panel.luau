@@ -345,7 +345,7 @@ local function restoreDrawer()
 
   local children = {
     ui.row({ gap = 8, align = "center" }, {
-      ui.glyph({ name = "undo", size = 14, color = "primary" }),
+      ui.glyph({ name = "arrow-back-up", size = 14, color = "primary" }),
       ui.label({ key = "restore-draft-title", text = tr("panel.action.restore"), fontWeight = "bold" }),
       ui.label({ text = tostring(draft.snapshot), color = "on_surface/0.6", fontSize = 12 }),
       ui.spacer({ flexGrow = 1 }),
@@ -453,7 +453,7 @@ local function snapshotRow(row)
     ui.button({
       key = "restore-" .. id,
       text = tr("panel.action.restore"),
-      glyph = "undo",
+      glyph = "arrow-back-up",
       variant = "secondary",
       controlSize = "sm",
       onClick = function()
@@ -599,7 +599,7 @@ local function snapshotsTab()
     ui.button({
       key = "sort",
       text = ui_state.sort == "newest" and tr("panel.filter.newest") or tr("panel.filter.oldest"),
-      glyph = "arrow-up-down",
+      glyph = "arrows-up-down",
       variant = "ghost",
       controlSize = "sm",
       onClick = function()

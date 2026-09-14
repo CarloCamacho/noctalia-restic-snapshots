@@ -290,28 +290,36 @@ function M.poll(token, paths, lastSize)
 end
 
 -- Keep at most maxLines trailing lines (the tail of `text`, newline inclusive).
+--
+-- One forward pass over the newlines, keeping the start offset of each of the last `maxLines`
+-- lines in a ring buffer, so the cost scales with the number of LINES and never with the byte
+-- count. The previous version walked the string backwards one character at a time and called
+-- sub() per character; on a multi-KB log that blew the HOST's per-callback CPU budget, and
+-- because a job log is published from the service's update() tick the whole tick died with
+-- "script callback 'update' exceeded its CPU budget" (seen live: an `ls --json` job log, ~97 KB).
+-- Plain-Lua tests have no such budget, so this loop must stay linear in lines.
 local function tailLines(text, maxLines)
-  if maxLines == nil or maxLines <= 0 then
+  local limit = tonumber(maxLines)
+  if limit == nil or limit <= 0 then
     return text
   end
-  local body = text
-  local trailing = ""
-  if body:sub(-1) == "\n" then
-    body = body:sub(1, -2)
-    trailing = "\n"
-  end
-  local index = #body
-  local seen = 0
-  while index >= 1 do
-    if body:sub(index, index) == "\n" then
-      seen = seen + 1
-      if seen >= maxLines then
-        return body:sub(index + 1) .. trailing
-      end
+  local starts = {}
+  local count = 0
+  local from = 1
+  local size = #text
+  while from <= size do
+    local newline = text:find("\n", from, true)
+    count = count + 1
+    starts[((count - 1) % limit) + 1] = from
+    if newline == nil then
+      break
     end
-    index = index - 1
+    from = newline + 1
   end
-  return text
+  if count <= limit then
+    return text
+  end
+  return text:sub(starts[((count - limit) % limit) + 1])
 end
 
 -- Bounded tail of a job log for the panel's viewer: never the whole file, and never more than
@@ -327,9 +335,13 @@ function M.readLog(path, maxBytes, maxLines)
   local bytes = tonumber(maxBytes) or LOG_TAIL_BYTES
   if bytes > 0 and #text > bytes then
     text = text:sub(-bytes)
-    -- Drop the partial first line: half a line is not a line the viewer can show.
+    -- Drop the partial first line: half a line is not a line the viewer can show. Unless the
+    -- bound landed inside a line with no newline after it at all (a log of one enormous line) --
+    -- then dropping it would show nothing, which is worse than a bounded partial line.
     local newline = text:find("\n", 1, true)
-    text = newline ~= nil and text:sub(newline + 1) or ""
+    if newline ~= nil then
+      text = text:sub(newline + 1)
+    end
   end
   return tailLines(text, tonumber(maxLines))
 end
