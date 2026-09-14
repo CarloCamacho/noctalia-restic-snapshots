@@ -1,0 +1,23 @@
+# Source index for this plugin repository.
+#
+# Noctalia reads this file to list and compatibility-check the plugins a source offers without
+# cloning it in full: a git source reads catalog.toml from its repo cache, a path source reads it
+# from disk directly. A git source with no catalog.toml resolves no plugins at all.
+#
+# This file is an index, not the manifest. Each plugin's own plugin.toml stays authoritative for
+# ids, entries, settings, dependencies and the version Noctalia actually installs; keep the rows
+# below in sync with it (and bump version here when you bump it there).
+
+[[plugin]]
+id           = "carlocamacho/restic-snapshots"
+name         = "Restic Snapshots"
+version      = "0.2.0"
+updated_at   = 1789392236
+added_at     = 1789392236
+author       = "carlocamacho"
+license      = "MIT"
+icon         = "archive"
+description  = "Scheduled restic backups with a snapshot browser, staging restore, and dry-run-gated retention."
+plugin_api   = 30
+tags         = ["system", "panel", "service", "shortcut", "utility"]
+dependencies = ["restic"]
