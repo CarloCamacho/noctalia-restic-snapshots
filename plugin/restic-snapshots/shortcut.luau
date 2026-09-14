@@ -12,10 +12,12 @@ local function send(event)
 end
 
 function update()
-  local running = status.phase == "running"
-  shortcut.setLabel("Backup")
+  local running = status.phase == "running" or status.busy == true
+  -- The label reuses the panel's back-up action string: one tap here starts the same job.
+  shortcut.setLabel(noctalia.tr("panel.action.backup_now"))
   shortcut.setIcon("archive", "archive-off")
   shortcut.setActive(running)
+  -- Disabled until there is both a binary and a repository to back up into, as in 0.1.0.
   shortcut.setEnabled(status.available == true and status.repoConfigured == true)
 end
 
