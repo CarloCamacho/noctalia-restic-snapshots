@@ -32,6 +32,7 @@ local env = require("./lib/env.luau")
 local schedule = require("./lib/schedule.luau")
 local state = require("./lib/state.luau")
 local store = require("./lib/store.luau")
+local metrics = require("./lib/metrics.luau")
 
 -- ── constants ────────────────────────────────────────────────────────────────
 
@@ -64,6 +65,13 @@ local INIT_ERROR_PATTERNS = { "does not exist", "unable to open config", "is the
 
 -- restic's own way of saying "another process holds the lock".
 local LOCK_ERROR_PATTERNS = { "already locked", "unable to create lock", "lock file", "is locked" }
+
+-- [0.3.0] The job runner's own line for a job that aborted before restic was ever started (see
+-- lib/jobs.luau). Recognising it keeps that failure from being described as a restic failure: for
+-- a failing pre-backup command restic never ran, and telling the user "backup failed" would send
+-- them to the wrong place entirely. The text is the runner's, already shown in the job log; this
+-- is a match, not a new message.
+local PRE_HOOK_ABORT_MARKER = "the pre-backup command failed; restic was not started"
 
 -- Restore verification (0.3.0).
 -- How many `restic ls --json` entries are kept when choosing which files to verify. restic emits
@@ -109,6 +117,14 @@ local hydrated = false
 local storedNextRunAt = nil
 local armedInterval = nil
 local lastSweepAt = nil
+-- [0.3.0] The snapshot count is published from `snapshots --json` (or restored from the store), and
+-- 0 is a legitimate value for an empty repository - so "we know the count" is tracked separately
+-- from the number itself. lib/metrics.luau omits what it is not told; passing a bare 0 for a count
+-- nobody has looked up would claim an empty repository.
+local snapshotsKnown = false
+-- One log line per failure streak for the metrics export, not one per transition: a metrics
+-- directory that keeps refusing writes must not fill the log.
+local metricsErrorLogged = false
 -- [0.3.0] restore verification: the last result, whether the user has already been told about a
 -- failure, and the window between "a verification began" and "its restore job started" (during
 -- which no job holds the guard, so update() must not start a second one).
@@ -306,30 +322,107 @@ local function republishJobLog()
   return true, nil
 end
 
--- ── signalling: TERM, then KILL ──────────────────────────────────────────────
+-- ── metrics export (0.3.0) ───────────────────────────────────────────────────
 
--- restic's own pid, as recorded by the job runner. Read from the pid file, never guessed, and
--- never a pid at or below 1: killing init or the whole process group is not recoverable.
-local function readPid(paths)
-  if type(paths) ~= "table" or type(paths.pid) ~= "string" then
-    return nil
+-- The exposition file (lib/metrics.luau) is written on *transitions* only -- a job finished,
+-- snapshots refreshed, a verification finished, the configuration changed -- and never from
+-- update(). Its value is that it dates the last real event; re-stamping it every couple of seconds
+-- would say the state changed when nothing did.
+--
+-- A value the service does not know is left out rather than sent as 0: "no backup has ever
+-- succeeded" and "a backup succeeded at the unix epoch" are different statements, and lib/metrics
+-- turns an absent field into an absent metric on purpose.
+local function metricsValues()
+  local values = {}
+
+  local success = tonumber(lastSuccessAt)
+  if success ~= nil then
+    values.lastSuccessAt = success
   end
-  local text = noctalia.readFile(paths.pid)
-  -- Parenthesised: gsub returns two values and tonumber would take the second as a base.
-  local pid = tonumber((trim(text)))
-  if pid == nil or pid <= 1 then
-    return nil
+  if snapshotsKnown then
+    values.snapshotCount = tonumber(status.snapshotCount) or 0
   end
-  return pid
+  local newest = tonumber(status.newestSnapshotAt)
+  if newest ~= nil then
+    values.newestSnapshotAt = newest
+  end
+  -- Staleness is only a statement about a repository we have actually seen; with no newest
+  -- snapshot at all, `status.stale` is the default false rather than a measurement.
+  if tonumber(status.newestSnapshotAt) ~= nil then
+    values.stale = status.stale == true
+  end
+
+  -- The repository size comes from the stats the service already refreshes for the panel. A
+  -- payload whose last refresh failed keeps the previous numbers and flags itself not ok, so it
+  -- is not a statement about the repository right now.
+  local stats = noctalia.state.get(state.KEY_STATS)
+  if type(stats) == "table" and stats.ok == true then
+    values.repoBytes = tonumber(stats.totalBytes)
+    values.repoFiles = tonumber(stats.totalFileCount)
+  end
+
+  if type(lastRun) == "table" and type(lastRun.kind) == "string" and lastRun.kind ~= "" then
+    values.jobKind = lastRun.kind
+    values.jobExitCode = tonumber(lastRun.exitCode)
+  end
+  local checkErrors = tonumber(lastCheckErrors)
+  if checkErrors ~= nil then
+    values.lastCheckErrors = checkErrors
+  end
+  if type(lastVerifyOk) == "boolean" then
+    values.verifyOk = lastVerifyOk
+  end
+  if type(status.verify) == "table" then
+    values.verifyMatched = tonumber(status.verify.matched)
+    values.verifyFailed = tonumber(status.verify.failed)
+  end
+
+  return values
 end
 
-local function signalKill(paths)
-  local pid = readPid(paths)
-  if pid == nil then
-    noctalia.log("restic: no restic pid recorded; nothing to kill")
-    return false
+-- Render and publish the exposition file. Called from the transitions, never from the tick, and
+-- deliberately silent about a disabled feature: no directory configured means no work at all.
+--
+-- A failure here is worth one log line per failure streak and must never travel back into the job
+-- that triggered it: the export is a courtesy to a scraper, not part of the backup.
+local function writeMetrics()
+  if cfg == nil or cfg.metricsDir == "" then
+    return
   end
-  return noctalia.runAsync({ "kill", "-KILL", tostring(pid) }) == true
+  local text = metrics.render(nowSec(), metricsValues())
+  if text == "" then
+    -- Nothing is known yet; an empty file would be a lie about a state we have no data for.
+    return
+  end
+  -- pcall as well as the (ok, err) result: a host API that raises must not turn a finished backup
+  -- into a failed one.
+  local fine, wrote, reason = pcall(metrics.write, cfg.metricsDir, text)
+  if fine and wrote == true then
+    metricsErrorLogged = false
+    return
+  end
+  if not fine then
+    reason = tostring(wrote)
+  end
+  if not metricsErrorLogged then
+    metricsErrorLogged = true
+    noctalia.log("restic: metrics export failed: " .. tostring(reason))
+  end
+end
+
+-- ── signalling: TERM, then KILL ──────────────────────────────────────────────
+
+-- SIGKILL a running job. Delegated to the runner's own M.signal so the escalation cannot disagree
+-- with the first attempt about *which* process it is signalling: the pid (the job script's, falling
+-- back to restic's own), the allow-list and kill's argv all come from that one place. The old
+-- local readPid only ever knew restic's pid, which is the hole this closes - while a pre-command
+-- ran there was no pid to escalate against at all.
+local function signalKill(paths)
+  local ok, err = jobs.signal(paths, "KILL")
+  if not ok then
+    noctalia.log("restic: could not kill the job: " .. tostring(err))
+  end
+  return ok == true
 end
 
 -- One escalation step per call: SIGTERM first, SIGKILL once the grace window has passed. Returns
@@ -433,6 +526,7 @@ refreshSnapshots = function(filter)
     local summary = restic.snapshotSummary(rows)
     status.snapshotCount = summary.count
     status.newestSnapshotAt = summary.newestAt
+    snapshotsKnown = true
     status.initNeeded = false
     status.error = ""
     applyStaleness(true)
@@ -450,6 +544,9 @@ refreshSnapshots = function(filter)
       lastRefreshAt = nowSec(),
     })
     publish()
+    -- A transition (snapshots refreshed), so the exposition file is rewritten here and never from
+    -- the tick.
+    writeMetrics()
   end, 30000)
   return true, nil
 end
@@ -518,10 +615,19 @@ startJob = function(kind, argv, request, buildErr)
   end
   -- envFile is the user's credentials file for cloud/remote backends; the runner sources it
   -- (single-quoted) before restic starts and never writes a secret into the generated script.
-  local token, err, paths = jobs.start(argv, {
+  local opts = {
     pathPrefix = env.binDir(resticPath),
     envFile = cfg.envFile,
-  })
+  }
+  -- [0.3.0] The pre/post-backup hooks belong to the *backup*: the settings are named for it, and a
+  -- check, a restore, a forget or an ls must never run them even when they are configured. An
+  -- empty setting means "no hook" (lib/jobs.luau ignores an empty string), so the defaults leave
+  -- every other job kind exactly as it was.
+  if kind == "backup" then
+    opts.preCommand = cfg.preBackupCommand
+    opts.postCommand = cfg.postBackupCommand
+  end
+  local token, err, paths = jobs.start(argv, opts)
   if token == nil then
     return false, err
   end
@@ -580,11 +686,21 @@ finishJob = function(job, exitCode, text)
   local request = type(job.request) == "table" and job.request or {}
 
   local errorMessage = ""
+  local preHookAborted = false
   if timedOut then
     errorMessage = "timed out"
   elseif not ok and not cancelled then
-    errorMessage = describeFailure(failureMessage(
-      logText ~= "" and logText or raw, kind .. " failed"))
+    -- A pre-backup command that refused to complete means restic was never started, so the job's
+    -- non-zero code is the hook's, not restic's. The runner writes its own line saying exactly
+    -- that, and it is the more specific reason - so it becomes the message instead of "backup
+    -- failed", which would blame the wrong process (and is what the generic fallback would say).
+    local jobText = logText ~= "" and logText or raw
+    if jobText:find(PRE_HOOK_ABORT_MARKER, 1, true) ~= nil then
+      preHookAborted = true
+      errorMessage = PRE_HOOK_ABORT_MARKER
+    else
+      errorMessage = describeFailure(failureMessage(jobText, kind .. " failed"))
+    end
   end
 
   lastRun = {
@@ -611,6 +727,10 @@ finishJob = function(job, exitCode, text)
     if kind == "verify" then
       -- The verification reports itself below, once, with its own counts and reason. Firing the
       -- generic "Restic verify failed" as well would notify twice for one failure.
+    elseif preHookAborted then
+      -- Not "Restic backup failed": restic never ran. The title is the first thing the user reads,
+      -- and it has to point at the hook rather than at restic.
+      noctalia.notifyError("Restic pre-backup command failed", errorMessage)
     elseif timedOut then
       noctalia.notifyError("Restic " .. kind .. " timed out", errorMessage)
     else
@@ -755,6 +875,11 @@ finishJob = function(job, exitCode, text)
       or kind == "init" or kind == "unlock") then
     refreshSnapshots()
   end
+
+  -- A transition (a job finished) - the last of the three so the exposition file carries this
+  -- run's outcome and its check/verify payload. Never from the tick, and never able to fail the
+  -- job: writeMetrics logs at most once per failure streak and returns.
+  writeMetrics()
 end
 
 local function pollJob()
@@ -869,6 +994,12 @@ local function loadConfig()
     verify_interval_hours = get("verify_interval_hours"),
     verify_file_count = get("verify_file_count"),
   })
+  -- [0.3.0] Settings lib/restic.luau's frozen config shape does not carry (they are consumed by
+  -- the service, not by restic's argv): attached here so every reader sees one config table.
+  -- Trimmed, because a setting that is only whitespace means "unset", exactly like "".
+  cfg.preBackupCommand = trim(get("pre_backup_command"))
+  cfg.postBackupCommand = trim(get("post_backup_command"))
+  cfg.metricsDir = trim(get("metrics_dir"))
 end
 
 local function resolveRestic()
@@ -916,6 +1047,11 @@ local function hydrate()
   end
   storedNextRunAt = tonumber(record.nextRunAt)
   status.snapshotCount = math.max(0, math.floor(tonumber(record.snapshotCount) or 0))
+  -- A persisted count is a real observation from a previous incarnation (the store is only written
+  -- on transitions), unlike the 0 an empty record leaves behind.
+  if tonumber(record.snapshotCount) ~= nil then
+    snapshotsKnown = true
+  end
   status.newestSnapshotAt = tonumber(record.newestSnapshotAt)
   status.stale = record.stale == true
   -- A repository already known to be stale must not be announced twice: the user was told in the
@@ -1123,6 +1259,9 @@ local function publishVerifyResult(at, ok, checked, matched, failed, detail)
     -- a restart. The flat keys above are what other consumers read.
     lastVerify = status.verify,
   })
+  -- A transition (a verification finished - or was attempted and could not prove anything), which
+  -- is also the only place a verify result reaches the exposition file when no job was involved.
+  writeMetrics()
 end
 
 -- A verification that could not run at all -- no snapshot, no usable files, an ls that failed.
@@ -1529,6 +1668,10 @@ local function initialise()
     republishJobLog()
     refreshSnapshots()
   end
+  -- A transition: the configuration was (re)loaded - on enable, on an edit, and at load. The
+  -- exposition file is rewritten here so a scraper sees the current state without waiting for the
+  -- next backup, and this is the only metrics write that does not follow a job or a refresh.
+  writeMetrics()
 end
 
 function update()

@@ -56,6 +56,20 @@ local function indexOf(text, needle)
   return text:find(needle, 1, true)
 end
 
+-- [0.3.0] Last occurrence. The pre-command phase now waits for its own child too, so
+-- "the normal path's wait" is the *last* one in the script, not the first.
+local function lastIndexOf(text, needle)
+  local last, from = nil, 1
+  while true do
+    local at = text:find(needle, from, true)
+    if at == nil then
+      return last
+    end
+    last = at
+    from = at + 1
+  end
+end
+
 local function lines(text)
   local out = {}
   for line in text:gmatch("[^\n]+") do
@@ -143,15 +157,31 @@ check("nothing of a hook value survives outside its quotes",
 
 -- The invocation: the variable is run through /bin/sh -c, the value is never inlined, and both
 -- streams go to the job log.
+--
+-- [0.3.0] The hooks now run in the *background* and are waited for, so the script's own TERM trap
+-- can reach a hook that is still running: a foreground child defers the trap, which is how a
+-- cancelled job kept its pre-command - and then started restic - after the watchdog had already
+-- released the single-flight guard. Backgrounding is the only change: the invocation is still
+-- `sh -c` with the variable (never the value), both streams still go to the job log, and `wait`
+-- restores the old ordering and the old exit code.
 check("the pre-command is invoked through sh -c with the variable, never the value",
-  lineFor(script, "/bin/sh -c \"$PRECOMMAND\"") == "/bin/sh -c \"$PRECOMMAND\" >> \"$logfile\" 2>&1",
+  lineFor(script, "/bin/sh -c \"$PRECOMMAND\"") == "/bin/sh -c \"$PRECOMMAND\" >> \"$logfile\" 2>&1 &",
   tostring(lineFor(script, "/bin/sh -c \"$PRECOMMAND\"")))
+check("the pre-command's pid is tracked for the trap and then waited for",
+  indexOf(script, "/bin/sh -c \"$PRECOMMAND\" >> \"$logfile\" 2>&1 &") < indexOf(script, "child=$!")
+    and indexOf(script, "child=$!") < lastIndexOf(script, "wait \"$child\"")
+    and indexOf(script, "wait \"$child\"") < indexOf(script, "prestatus=$?"),
+  tostring(indexOf(script, "child=$!")) .. "/" .. tostring(indexOf(script, "wait \"$child\"")))
 check("the pre-command value is never inlined after sh -c",
   script:find("sh -c " .. PRE_HOSTILE, 1, true) == nil)
 check("the post-command is invoked through sh -c with the variable, never the value",
   lineFor(script, "sh -c \"$POSTCOMMAND\"")
-    == "RESTIC_EXIT=\"$resticexit\" /bin/sh -c \"$POSTCOMMAND\" >> \"$logfile\" 2>&1",
+    == "RESTIC_EXIT=\"$resticexit\" /bin/sh -c \"$POSTCOMMAND\" >> \"$logfile\" 2>&1 &",
   tostring(lineFor(script, "sh -c \"$POSTCOMMAND\"")))
+check("the post-command's pid is tracked and waited for too, before the exit code is recorded",
+  indexOf(script, "sh -c \"$POSTCOMMAND\"") < indexOf(script, "printf '%s' \"$resticexit\" > \"$exitfile\"")
+    and lastIndexOf(script, "child=$!") > indexOf(script, "sh -c \"$POSTCOMMAND\""),
+  tostring(lastIndexOf(script, "child=$!")))
 check("the post-command value is never inlined after sh -c",
   script:find("sh -c " .. POST_HOSTILE, 1, true) == nil)
 
@@ -192,7 +222,8 @@ check("the abort branch removes the fifo",
 check("the abort branch exits with the pre-command's code",
   indexOf(script, "exit \"$prestatus\"") ~= nil)
 check("the abort branch comes before the normal path's fifo cleanup",
-  indexOf(script, "exit \"$prestatus\"") < indexOf(script, "wait \"$child\""))
+  indexOf(script, "exit \"$prestatus\"") < (lastIndexOf(script, "wait \"$child\"") or 0),
+  tostring(indexOf(script, "exit \"$prestatus\"")) .. "/" .. tostring(lastIndexOf(script, "wait \"$child\"")))
 check("the abort branch says why no backup ran",
   indexOf(script, "the pre-backup command failed; restic was not started") ~= nil)
 
@@ -297,8 +328,10 @@ for _, line in ipairs(bareLines) do
 end
 check("hooks only add lines: everything else is unchanged and in order",
   missingInOrder(expected, hookedLines) == nil, tostring(missingInOrder(expected, hookedLines)))
+-- 15 hook lines minus the one exit-code write they replace, plus two per hook for the backgrounded
+-- child: `child=$!` and the `wait "$child"` that restores the old ordering (0.3.0 cancellation).
 check("hooks add exactly their own lines and nothing else",
-  #hookedLines == #bareLines + 15 - 1, tostring(#hookedLines) .. " vs " .. tostring(#bareLines))
+  #hookedLines == #bareLines + 15 - 1 + 4, tostring(#hookedLines) .. " vs " .. tostring(#bareLines))
 
 -- ── a multi-line command is still one quoted value ───────────────────────────
 
