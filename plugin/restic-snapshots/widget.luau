@@ -4,6 +4,10 @@
 -- [0.2.0] The glyph and the colour carry the state, and the tooltip lists the same fields the
 -- panel shows so the two never disagree. Every string comes from a frozen key in
 -- translations/en.json.
+--
+-- [0.3.0] The tooltip also carries the last integrity check and the last restore verification, and a
+-- verification that failed -- or that compared nothing and so proved nothing -- gets a short label in
+-- the bar next to the staleness readout, because a hover is not a notification.
 
 local restic = require("./lib/restic.luau")
 local schedule = require("./lib/schedule.luau")
@@ -87,6 +91,80 @@ local function verdict()
   return tr("panel.label.failed")
 end
 
+-- The last integrity check, from status.checks = { lastAt, lastOk, numErrors }: the same facts the
+-- panel's Run tab shows, so the two never disagree.
+local function checkValue()
+  local checks = status.checks
+  local at = type(checks) == "table" and tonumber(checks.lastAt) or nil
+  if at == nil then
+    return tr("panel.label.never")
+  end
+  local errors = tonumber(checks.numErrors) or 0
+  local verdictText = tr("panel.label.ok")
+  if errors > 0 then
+    -- The error count outranks a lastOk of true: a check that reported errors must not read as ok.
+    verdictText = tr("panel.label.failed") .. " · " .. tr("panel.label.check_errors", { errors = tostring(errors) })
+  elseif checks.lastOk ~= true then
+    verdictText = tr("panel.label.failed")
+  end
+  return ago(at) .. " · " .. verdictText
+end
+
+-- The last restore verification, from status.verify. Success is judged on the counts, never on
+-- lastOk: a run that compared nothing (checked > 0, matched == 0) publishes lastOk = true and proved
+-- nothing, so it reads as "0 of N files matched" rather than as a pass.
+local function verifyValue()
+  local verify = status.verify
+  if type(verify) ~= "table" then
+    return tr("panel.label.never_verified")
+  end
+  local at = tonumber(verify.lastAt)
+  local checked = tonumber(verify.checked) or 0
+  local matched = tonumber(verify.matched) or 0
+  local failed = tonumber(verify.failed) or 0
+  local value
+  if checked == 0 then
+    -- Nothing could be checked at all: the verdict word is all there is to say.
+    value = tr("panel.label.failed")
+  elseif failed > 0 then
+    value = tr("panel.label.failed") .. " · "
+      .. tr("panel.label.verified_fail", { failed = tostring(failed), checked = tostring(checked) })
+  elseif matched > 0 then
+    value = tr("panel.label.ok") .. " · "
+      .. tr("panel.label.verified_ok", { matched = tostring(matched), checked = tostring(checked) })
+  else
+    -- Every file was skipped. Not a success claim and not a failure claim: the counts speak.
+    value = tr("panel.label.verified_ok", { matched = "0", checked = tostring(checked) })
+  end
+  if at ~= nil then
+    value = value .. " " .. ago(at)
+  end
+  return value
+end
+
+-- The bar label for a verification the user needs to know about without hovering. Two cases, one
+-- short label each: a real mismatch (the same class of problem as a stale repository -- the backup
+-- does not restore) and the run that compared nothing (there is no proof the backup restores). Not
+-- gated by show_staleness: that setting is about the staleness readout, and a failure is already
+-- reported unconditionally through the error colour.
+local function verifyHint()
+  local verify = status.verify
+  if type(verify) ~= "table" then
+    return nil
+  end
+  local checked = tonumber(verify.checked) or 0
+  local matched = tonumber(verify.matched) or 0
+  local failed = tonumber(verify.failed) or 0
+  if checked > 0 and failed > 0 then
+    return tr("panel.action.verify") .. ": " .. tr("panel.label.failed"), "error"
+  end
+  if checked > 0 and matched == 0 and failed == 0 then
+    return tr("panel.action.verify") .. ": "
+      .. tr("panel.label.verified_ok", { matched = "0", checked = tostring(checked) }), "tertiary"
+  end
+  return nil
+end
+
 local function render()
   local colour = colourFor()
   local children = {
@@ -105,6 +183,14 @@ local function render()
       color = "error",
       fontSize = 11,
     }))
+  end
+
+  -- A verification that failed, or that compared nothing, is labelled in the bar itself: the tooltip
+  -- is only read on hover, and "the backup does not restore" / "nothing proved the backup restores"
+  -- are exactly the facts this widget exists to surface.
+  local hintText, hintColor = verifyHint()
+  if hintText ~= nil then
+    table.insert(children, ui.label({ key = "verify-hint", text = hintText, color = hintColor, fontSize = 11 }))
   end
 
   barWidget.render(ui.row({ gap = 6, align = "center" }, children))
@@ -138,6 +224,10 @@ local function render()
   else
     row(tr("widget.row.last_run"), tr("panel.label.never"))
   end
+
+  -- The two results the panel's Run tab shows beside the last run, in the same order.
+  row(tr("panel.label.last_check"), checkValue())
+  row(tr("panel.label.last_verified"), verifyValue())
 
   row(tr("widget.row.next_run"), schedule.untilLabel(nowSec(), status.nextRun))
 

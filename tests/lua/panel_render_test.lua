@@ -439,6 +439,293 @@ H.stateValues["restic_status"].busy = false
 H.stateValues["restic_status"].job = nil
 render()
 
+-- ── run tab: the last check and the last verification (0.3.0) ────────────────
+-- status.checks = { lastAt, lastOk, numErrors } and status.verify = { lastAt, lastOk, checked,
+-- matched, failed, detail } are the published shapes (lib/state.luau, contract 5.2). Neither was
+-- rendered before 0.3.0: a check that reported errors only ever appeared in the Log tab, and a
+-- verification result existed nowhere in the UI at all.
+
+local function nodeText(key)
+  local node = nodeByKey(key)
+  if node == nil then
+    return nil
+  end
+  return tostring(node.props.text)
+end
+
+-- Never checked, never verified: both lines say so, and the button is offered from the start (an
+-- empty result must not be the only way to ask for one).
+H.stateValues["restic_status"].checks = nil
+H.stateValues["restic_status"].verify = nil
+render()
+check("run tab says a check has never run",
+  nodeText("checks-value") == "never", tostring(nodeText("checks-value")))
+check("run tab labels the check line from the frozen key",
+  H.text(H.tree):find("Last check", 1, true) ~= nil, H.text(H.tree))
+check("run tab says nothing was ever verified",
+  nodeText("verify-verdict") == "never", tostring(nodeText("verify-verdict")))
+check("run tab labels the verification line from the frozen key",
+  H.text(H.tree):find("Last verified", 1, true) ~= nil, H.text(H.tree))
+check("no counts line before a verification", nodeByKey("verify-counts") == nil)
+check("no detail line before a verification", nodeByKey("verify-detail") == nil)
+
+local verifyButton = nodeByKey("verify-now")
+check("the verify button exists", verifyButton ~= nil)
+check("the verify button reads from the frozen key",
+  verifyButton ~= nil and verifyButton.props.text == "Verify restore", verifyButton ~= nil and verifyButton.props.text)
+check("the verify button is enabled when a verification can run",
+  verifyButton ~= nil and verifyButton.props.enabled == true)
+
+local beforeVerify = #H.commands
+verifyButton.props.onClick()
+local verifyArgv = H.commands[#H.commands] or {}
+check("the verify button sends verify-restore",
+  table.concat(verifyArgv, " "):find("verify-restore", 1, true) ~= nil, table.concat(verifyArgv, " "))
+check("verify sent exactly one command", #H.commands == beforeVerify + 1, tostring(#H.commands - beforeVerify))
+check("verify sends no payload", #verifyArgv == 6, table.concat(verifyArgv, " "))
+
+H.stateValues["restic_status"].available = false
+render()
+check("the verify button is disabled without restic", nodeByKey("verify-now").props.enabled == false)
+H.stateValues["restic_status"].available = true
+H.stateValues["restic_status"].repoConfigured = false
+render()
+check("the verify button is disabled without a repository", nodeByKey("verify-now").props.enabled == false)
+H.stateValues["restic_status"].repoConfigured = true
+render()
+
+-- A passed verification: when it ran, that it passed, and the counts.
+H.stateValues["restic_status"].verify = {
+  lastAt = 1788874202, lastOk = true, checked = 4, matched = 4, failed = 0,
+  detail = "4 of 4 files matched",
+}
+render()
+check("a passed verification renders when it ran and that it passed",
+  nodeText("verify-verdict") == "6m ago · ok", tostring(nodeText("verify-verdict")))
+check("a passed verification renders its counts",
+  nodeText("verify-counts") == "4 of 4 files matched", tostring(nodeText("verify-counts")))
+check("a passed verification is not coloured as a failure",
+  nodeByKey("verify-verdict").props.color == "on_surface", nodeByKey("verify-verdict").props.color)
+check("a clean pass repeats nothing in a detail line", nodeByKey("verify-detail") == nil)
+
+-- A failed verification: a failure, in the error colour, with the mismatch detail the service sent.
+H.stateValues["restic_status"].verify = {
+  lastAt = 1788874202, lastOk = false, checked = 3, matched = 1, failed = 2,
+  detail = "2 of 3 checked files do not match the backup: /home/ian/dots/x: differs",
+}
+render()
+check("a failed verification renders as failed",
+  nodeText("verify-verdict") == "6m ago · failed", tostring(nodeText("verify-verdict")))
+check("a failed verification uses the error colour",
+  nodeByKey("verify-verdict").props.color == "error", nodeByKey("verify-verdict").props.color)
+check("a failed verification renders the matched count",
+  nodeText("verify-counts") == "1 of 3 files matched", tostring(nodeText("verify-counts")))
+check("a failed verification renders the failed count as its own line",
+  nodeText("verify-failed") == "2 of 3 files did not match", tostring(nodeText("verify-failed")))
+check("a failed verification names the mismatch",
+  H.text(H.tree):find("do not match the backup: /home/ian/dots/x", 1, true) ~= nil, H.text(H.tree))
+check("the failed detail is coloured as a failure",
+  nodeByKey("verify-detail").props.color == "error", nodeByKey("verify-detail").props.color)
+
+-- The honesty case: checked > 0 but nothing was compared (every file skipped, because the live copy
+-- legitimately changed or was gone). The service publishes lastOk = true for this on purpose, and the
+-- panel must NOT read that as a verification.
+local SKIPPED_DETAIL = "3 file(s) restored and read back, but none could be compared with a live file"
+H.stateValues["restic_status"].verify = {
+  lastAt = 1788874202, lastOk = true, checked = 3, matched = 0, failed = 0,
+  detail = SKIPPED_DETAIL,
+}
+render()
+check("an all-skipped verification shows the counts as zero matched",
+  nodeText("verify-counts") == "0 of 3 files matched", tostring(nodeText("verify-counts")))
+check("an all-skipped verification does not claim a success verdict",
+  nodeText("verify-verdict") == "6m ago", tostring(nodeText("verify-verdict")))
+check("an all-skipped verification is not coloured as a success",
+  nodeByKey("verify-counts").props.color == "tertiary", nodeByKey("verify-counts").props.color)
+check("an all-skipped verification shows the service's own detail sentence",
+  H.text(H.tree):find(SKIPPED_DETAIL, 1, true) ~= nil, H.text(H.tree))
+check("an all-skipped verification never reads as N verified",
+  H.text(H.tree):find("3 of 3 files matched", 1, true) == nil
+    and H.text(H.tree):find("files verified", 1, true) == nil, H.text(H.tree))
+
+-- Nothing could be checked at all: a failure with a reason, and no "0 of 0 files matched" line that
+-- would read like a pass.
+H.stateValues["restic_status"].verify = {
+  lastAt = 1788874202, lastOk = false, checked = 0, matched = 0, failed = 0,
+  detail = "there is no snapshot to verify",
+}
+render()
+check("a verification that could not run reads as failed",
+  nodeText("verify-verdict") == "6m ago · failed", tostring(nodeText("verify-verdict")))
+check("a verification that could not run renders no counts line", nodeByKey("verify-counts") == nil)
+check("a verification that could not run shows the reason",
+  H.text(H.tree):find("there is no snapshot to verify", 1, true) ~= nil, H.text(H.tree))
+
+-- Exactly the checked - matched - failed arithmetic: 5 checked, 2 matched, 1 failed, 2 skipped. The
+-- frozen shape carries no `skipped` field and en.json has no key for one (reported to the lead:
+-- `panel.label.verified_skipped` does not exist), so the panel states the two counts it has and the
+-- remainder is the difference between them.
+H.stateValues["restic_status"].verify = {
+  lastAt = 1788874202, lastOk = true, checked = 5, matched = 2, failed = 1,
+  detail = "1 of 5 checked files do not match the backup: /home/ian/dots/y",
+}
+render()
+check("a partly failed verification reports the matched count",
+  nodeText("verify-counts") == "2 of 5 files matched", tostring(nodeText("verify-counts")))
+check("a partly failed verification reports the failed count",
+  nodeText("verify-failed") == "1 of 5 files did not match", tostring(nodeText("verify-failed")))
+
+-- While a job is in flight the button is disabled (not hidden) and the last result stays readable.
+H.stateValues["restic_status"].verify = {
+  lastAt = 1788874202, lastOk = true, checked = 4, matched = 4, failed = 0, detail = "",
+}
+H.stateValues["restic_status"].phase = "running"
+H.stateValues["restic_status"].busy = true
+render()
+check("the verify button is disabled while a job is in flight",
+  nodeByKey("verify-now").props.enabled == false)
+check("the last verification stays rendered while a job is in flight",
+  nodeText("verify-counts") == "4 of 4 files matched", tostring(nodeText("verify-counts")))
+H.stateValues["restic_status"].phase = "idle"
+H.stateValues["restic_status"].busy = false
+render()
+
+-- The integrity check: when it last ran and what it found.
+H.stateValues["restic_status"].checks = { lastAt = 1788871002, lastOk = true, numErrors = 0 }
+render()
+check("the check line renders when it ran and that it passed",
+  nodeText("checks-value") == "1h ago · ok", tostring(nodeText("checks-value")))
+check("a passing check is not coloured as a problem",
+  nodeByKey("checks-value").props.color == "on_surface", nodeByKey("checks-value").props.color)
+
+H.stateValues["restic_status"].checks = { lastAt = 1788871002, lastOk = false, numErrors = 3 }
+render()
+check("a check that reported errors reads as failed",
+  nodeText("checks-value") == "1h ago · failed · 3 errors", tostring(nodeText("checks-value")))
+check("a check that reported errors uses the error colour",
+  nodeByKey("checks-value").props.color == "error", nodeByKey("checks-value").props.color)
+
+-- An error count beside a lastOk of true must still not read as green: "ok · 3 errors" would
+-- contradict itself.
+H.stateValues["restic_status"].checks = { lastAt = 1788871002, lastOk = true, numErrors = 3 }
+render()
+check("errors outrank a lastOk of true",
+  nodeText("checks-value") == "1h ago · failed · 3 errors", tostring(nodeText("checks-value")))
+check("an errored check is never green",
+  nodeByKey("checks-value").props.color == "error", nodeByKey("checks-value").props.color)
+
+H.stateValues["restic_status"].checks = { lastAt = 1788871002, lastOk = false }
+render()
+check("a check with no summary and no errors still reads as failed",
+  nodeText("checks-value") == "1h ago · failed", tostring(nodeText("checks-value")))
+
+-- ── diff: the changed paths (0.3.0) ──────────────────────────────────────────
+-- KEY_DIFF used to render counts only. The paths come from restic.parseDiff as addedPaths /
+-- removedPaths / changedPaths and are bounded exactly like the file listing: MAX_DIFF_ROWS rows, and
+-- whatever was left out is stated.
+
+clickTab("snapshots")
+
+local function diffPaths(count, prefix)
+  local list = {}
+  for index = 1, count do
+    table.insert(list, string.format("%s/p%d.txt", prefix, index))
+  end
+  return list
+end
+
+publish("restic_diff", {
+  from = "bbb222", to = "aaa111", added = 1, removed = 1, changed = 1,
+  truncated = false, at = 1788874602, ok = true,
+  addedPaths = { "/tmp/data/new.txt" },
+  removedPaths = { "/srv/gone.txt" },
+  changedPaths = { "/etc/hosts" },
+})
+text = H.text(H.tree)
+check("diff renders the changed paths heading",
+  text:find("Changed paths", 1, true) ~= nil, text)
+check("diff lists an added path", text:find("/tmp/data/new.txt", 1, true) ~= nil, text)
+check("diff lists a removed path", text:find("/srv/gone.txt", 1, true) ~= nil, text)
+check("diff lists a changed path", text:find("/etc/hosts", 1, true) ~= nil, text)
+local pathRows = H.findAll(H.tree, H.byKey("diff-path-"))
+check("diff renders one row per path", #pathRows == 3, tostring(#pathRows))
+check("diff markers name the direction",
+  pathRows[1].children[1].props.text == "+" and pathRows[2].children[1].props.text == "-"
+    and pathRows[3].children[1].props.text == "~",
+  pathRows[1].children[1].props.text .. pathRows[2].children[1].props.text .. pathRows[3].children[1].props.text)
+check("diff does not announce a cut when nothing was dropped",
+  nodeByKey("diff-more") == nil and nodeByKey("diff-truncated") == nil)
+
+-- More paths than the bound: the list is cut and the panel says how many it left out.
+local many = diffPaths(15, "/tmp/data/many")
+publish("restic_diff", {
+  from = "bbb222", to = "aaa111", added = 15, removed = 0, changed = 0,
+  truncated = false, at = 1788874602, ok = true,
+  addedPaths = many, removedPaths = {}, changedPaths = {},
+})
+pathRows = H.findAll(H.tree, H.byKey("diff-path-"))
+check("the diff path list is bounded to 12 rows", #pathRows == 12, tostring(#pathRows))
+check("the diff says how many paths it left out",
+  nodeText("diff-more") == "and 3 more", tostring(nodeText("diff-more")))
+check("a bounded diff list is not also announced as parser-truncated", nodeByKey("diff-truncated") == nil)
+check("the dropped paths are absent from the tree",
+  H.text(H.tree):find("many/p13.txt", 1, true) == nil, "p13 leaked into the tree")
+
+-- truncated = true with everything the panel was handed already shown: the parser dropped paths, so
+-- how many are missing is unknown and the panel states only the number it listed.
+publish("restic_diff", {
+  from = "bbb222", to = "aaa111", added = 2, removed = 0, changed = 0,
+  truncated = true, at = 1788874602, ok = true,
+  addedPaths = { "/tmp/data/a.txt", "/tmp/data/b.txt" }, removedPaths = {}, changedPaths = {},
+})
+check("a parser-truncated diff list is announced",
+  nodeText("diff-truncated") == "listing truncated to the first 2 entries", tostring(nodeText("diff-truncated")))
+check("a parser-truncated diff list names no invented remainder", nodeByKey("diff-more") == nil)
+check("a parser-truncated diff still lists what it has",
+  H.text(H.tree):find("/tmp/data/b.txt", 1, true) ~= nil, H.text(H.tree))
+
+-- The paths may arrive under the count names instead; the counts then come from the lists themselves
+-- rather than rendering "table: 0x...".
+publish("restic_diff", {
+  from = "bbb222", to = "aaa111", truncated = false, at = 1788874602, ok = true,
+  added = { "/tmp/data/under-count.txt" }, removed = {}, changed = {},
+})
+text = H.text(H.tree)
+check("diff reads paths published under the count names",
+  text:find("/tmp/data/under-count.txt", 1, true) ~= nil, text)
+check("diff counts a list published under a count name",
+  nodeText("diff-counts") == "1 added · 0 removed · 0 changed", tostring(nodeText("diff-counts")))
+
+-- ── "this host only" reads /etc/hostname (0.3.0) ─────────────────────────────
+-- The old filter inferred the host from the newest tagged snapshot. restic records the host of the
+-- machine that MADE a snapshot, and one repository can hold snapshots from several machines, so the
+-- inference could silently select the wrong host. /etc/hostname is the machine's own answer.
+
+nodeByKey("filter-select").props.onChange("1")
+H.files["/etc/hostname"] = nil
+render()
+check("this host only falls back to the inference when /etc/hostname is unreadable",
+  rowCount() == 2, tostring(rowCount()))
+H.files["/etc/hostname"] = "\n"
+render()
+check("this host only falls back when /etc/hostname is blank", rowCount() == 2, tostring(rowCount()))
+H.files["/etc/hostname"] = "cachyos-x8664\n"
+render()
+check("this host only uses /etc/hostname, not a snapshot's hostname",
+  rowCount() == 0, tostring(rowCount()))
+H.files["/etc/hostname"] = "nas\n"
+render()
+check("this host only trims and matches the file exactly",
+  rowCount() == 1, tostring(rowCount()))
+check("this host only keeps the row the file names",
+  H.text(H.tree):find("bbb222", 1, true) ~= nil, H.text(H.tree))
+H.files["/etc/hostname"] = "/etc/hostname's own host\n" -- never a hostname a snapshot carries
+render()
+check("a rowless hostname is not silently ignored", rowCount() == 0, tostring(rowCount()))
+H.files["/etc/hostname"] = nil
+nodeByKey("filter-select").props.onChange("0")
+check("back to all snapshots after the hostname checks", rowCount() == 3, tostring(rowCount()))
+
 -- ── log tab ──────────────────────────────────────────────────────────────────
 
 publish("restic_joblog", {
