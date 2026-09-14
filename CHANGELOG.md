@@ -1,6 +1,99 @@
 # Changelog
 
-## 0.2.0 — unreleased
+## 0.3.0 — unreleased
+
+The proof release. 0.2.0 made the plugin honest about whether a backup *ran*; 0.3.0 makes it honest
+about whether that backup *restores*, and adds the three things that let it live in a machine you
+actually run: a command before and after the backup, an entry in the launcher, and a Prometheus
+export.
+
+### Added
+
+- **Restore verification — proof that a backup restores, not just that it ran.**
+  `verify_interval_hours` (default `0`, i.e. off) and `verify_file_count` (default `3`). On the
+  cadence, or on demand from the Run tab's new *Verify restore* button and the `verify-restore` IPC
+  event, a sample of regular files is restored from the newest snapshot into
+  `<restore_target>/.verify/<epoch>/` and compared byte-for-byte with the live files. The panel shows
+  **Last verified** — `3 of 3 files matched`, or the reason it failed — and the same result is
+  published on the status as `verify` (`lastAt`, `lastOk`, `checked`, `matched`, `failed`, `detail`).
+  A file that legitimately changed after the snapshot, or is gone, is reported as *skipped* rather
+  than failed; a verification that could not run at all is reported as a failure with the reason and
+  never as a pass. One notification per transition into failure, none on success.
+- **Pre- and post-backup commands.** `pre_backup_command` and `post_backup_command` run *inside* the
+  job, so they inherit its timeout, its cancellation and its log, and are invoked as
+  `/bin/sh -c "$PRECOMMAND"` from a quoted assignment rather than inlined into a command line. A
+  non-zero pre-backup command **aborts the backup before restic starts** and becomes the run's
+  reported result; the post-backup command runs whatever restic's exit code was, receives it in
+  `RESTIC_EXIT`, and its own failure never changes the recorded result. Both appear in the job log
+  (and the Log tab) behind `== pre-backup command ==` / `== post-backup command ==`. With both
+  settings empty, the generated script is byte-identical to 0.2.0's.
+- **Launcher provider `/snap`.** The eight newest snapshots — short id, local time, host, file count,
+  size — followed by **Back up now**, **Check repository** and **Open Restic Snapshots**. Activating a
+  snapshot loads its file listing into the panel and opens the panel; typing a hostname, a tag or a
+  short id narrows the list (case-insensitive substring first, the shell's fuzzy matcher as a
+  fallback), and a query that matches nothing publishes an empty list rather than an error.
+- **Prometheus textfile export.** `metrics_dir` makes the plugin write `restic_snapshots.prom`
+  atomically (temp file + rename) whenever the state changes — a job finishing, a snapshot refresh, a
+  check, a verification — for a `node_exporter` textfile collector or any scraper reading the
+  directory. It carries `last_success_timestamp_seconds`, `count`, `newest_age_seconds`, `stale`,
+  `repo_bytes`, `repo_files`, `last_job_exit_code{kind="…"}`, `last_check_errors`, `last_verify_ok`,
+  `last_verify_matched`, `last_verify_failed` and `export_timestamp_seconds`. A value the plugin does
+  not know is **omitted, never exported as zero**, so "no backup ever recorded" and "a backup at the
+  Unix epoch" stay different statements. An empty `metrics_dir` means no writes at all, and a failed
+  write is logged once without disturbing the service.
+- **Panel follow-ups.** The Run tab renders the result of the last integrity check and the last
+  verification; a diff lists the paths that changed (bounded, with a count of the rest); the *this
+  host only* filter uses the real local hostname (`/etc/hostname`, falling back to the previous
+  inference when it cannot be read).
+- **Guards for the defects a plain-Lua test cannot see.** `tests/test_source_invariants.py` rejects
+  any per-character string walk in the plugin and checks every glyph name against the host's Tabler
+  icon set; `tests/lua/jobs_readlog_test.lua` covers a 5,000-line tail and a 200 KB single line.
+
+### Fixed
+
+- **The job-log tail blew the host's per-callback CPU budget and killed the service's update tick.**
+  `tailLines` walked the log backwards one character at a time (`text:sub(i, i)`); on a ~97 KB
+  `ls --json` job log the host aborted the whole tick with
+  `script callback 'update' exceeded its CPU budget`, so the panel stopped updating and the job's
+  summary — file counts, the retention preview — was thrown away. The walk is now one forward pass
+  over the newlines with a ring buffer, so its cost is linear in **lines** and never in bytes, and
+  the invariants suite fails on the old pattern.
+- **Two glyph names that rendered as blank boxes.** The Restore button and the restore drawer used
+  `undo` (now `arrow-back-up`) and the sort toggle used `arrow-up-down` (now `arrows-up-down`); the
+  host logged `[WRN] [glyph] missing glyph: …` and drew nothing at all. Every glyph name in the
+  plugin is now checked against the host's icon set.
+- **A job log that is one enormous line was shown as empty.** When the byte bound landed inside a
+  line with no newline after it, the reader dropped the partial first line and with it the entire
+  log; it now keeps the bounded tail in that case, which is more useful than showing nothing.
+  (Found by the test written for the two defects above — the same live-testing pass.)
+- **A cancel is a cancel, not a result — and it now reaches the verification job too.** A run stopped
+  with *Cancel* is recorded as *cancelled* in the Run tab and the log header, notified once as
+  information, and leaves `status.error` and the last-success time untouched, so the bar module does
+  not go red for something you did on purpose; the schedule re-arms from that moment rather than from
+  the last success. This matters more in 0.3.0 because restore verification is an ordinary job:
+  *Cancel* stops it, the watchdog covers it, and a cancelled verification is never recorded as a
+  successful one. The cancel is carried as an explicit flag rather than inferred from the exit code,
+  so a restic that dies from a signal nobody sent is still a failure.
+
+### Changed
+
+- **The generated job script changes only when you use a hook.** With both commands empty not one
+  hook line is emitted (the tests assert byte identity against the 0.2.0 generator). With a
+  post-backup command, the job's `.exit` file is written only *after* it finishes, so a job is not
+  reported as finished — and its log is not complete — until its follow-up is done.
+- **`verify` is a job kind like any other.** It appears in the job log header, in the Run tab's
+  last-run line and as the `kind` label of the metrics export, and it is covered by the single-flight
+  guard, the watchdog and *Cancel*.
+- **The published status gained a `verify` field** alongside `checks`, and both survive a shell
+  restart (the last verification's result and counts are persisted with the schedule).
+- **`verify-restore` joined the frozen event set** in `lib/state.luau`. Its optional
+  `{"target": "…"}` payload is validated like every other restore target, and an unusable target is
+  rejected with a notification rather than starting anything.
+- **Launcher rows carry the manifest's `Snapshots` category** so the launcher's filter bar works —
+  the launcher compares that label literally, which is why it is not translated. The unused
+  `launcher.category.snapshots` translation key was dropped.
+
+## 0.2.0 — 2026-09-14
 
 The trust release: the five things that made 0.1.0 unsafe to leave running, plus the features that
 make the plugin worth watching.
