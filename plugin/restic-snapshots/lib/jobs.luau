@@ -169,17 +169,61 @@ function M.start(argv, opts)
   }
 end
 
+-- The signals M.signal will send. An allow-list rather than a pass-through: the name is built into
+-- kill's argv, so anything else - a flag, a second pid, a shell metacharacter - must be unreachable.
+-- The service escalates deliberately: TERM first, then KILL after a grace period.
+local ALLOWED_SIGNALS = {
+  TERM = true,
+  KILL = true,
+}
+
+-- Read a job's recorded pid. Returns a number greater than 1, or nil when the file is missing,
+-- unreadable, empty or does not hold a plain process id. Digits only, so that what the file holds
+-- reaches kill - and, in sweep, /proc - as a number and never as anything else.
+local function readPid(pidPath)
+  if type(pidPath) ~= "string" or pidPath == "" then
+    return nil
+  end
+  local text = noctalia.readFile(pidPath)
+  if type(text) ~= "string" then
+    return nil
+  end
+  local digits = text:match("^%s*(%d+)%s*$")
+  if digits == nil then
+    return nil
+  end
+  local pid = tonumber(digits)
+  if pid == nil or pid <= 1 then
+    return nil
+  end
+  return pid
+end
+
+-- Signal a running job's restic process. Returns true when the signal was accepted, plus an error
+-- string otherwise. This is the single place that reads and validates a pid, so an escalation
+-- (TERM, then KILL) cannot drift from the first attempt. Kill's argv is built here and nowhere else,
+-- and only `ALLOWED_SIGNALS` members can reach it.
+function M.signal(paths, signalName)
+  if type(paths) ~= "table" then
+    return false, "no job to signal"
+  end
+  if ALLOWED_SIGNALS[signalName] ~= true then
+    return false, "unsupported signal"
+  end
+  local pid = readPid(paths.pid)
+  if pid == nil then
+    return false, "no usable pid"
+  end
+  if noctalia.runAsync({ "kill", "-" .. signalName, tostring(pid) }) ~= true then
+    return false, "could not signal the job"
+  end
+  return true, nil
+end
+
 -- Terminate a running job's restic process. Returns true when a signal was sent.
 function M.cancel(paths)
-  if type(paths) ~= "table" or type(paths.pid) ~= "string" then
-    return false
-  end
-  local pidText = noctalia.readFile(paths.pid)
-  local pid = tonumber((tostring(pidText or ""):gsub("%s+$", "")))
-  if pid == nil or pid <= 1 then
-    return false
-  end
-  return noctalia.runAsync({ "kill", "-TERM", tostring(pid) }) == true
+  local ok = M.signal(paths, "TERM")
+  return ok == true
 end
 
 -- Poll a job. Returns { done, exitCode, text, statusLine, changed, size }.
@@ -290,9 +334,25 @@ function M.readLog(path, maxBytes, maxLines)
   return tailLines(text, tonumber(maxLines))
 end
 
--- Delete *finished* job files older than maxAgeMs. A token whose `.exit` file is missing is
--- still running (or was killed), and its files - including the fifo and the status file - are
--- never removed.
+-- Is the process recorded in `pidPath` still running? The host answers this without spawning
+-- anything and without needing read access to the process: `/proc/<pid>` exists exactly while that
+-- process does, and `fileExists` reads an absolute path verbatim. Returns nil when there is no
+-- usable pid to test, so the caller can keep the old "no `.exit` means running" rule.
+local function pidAlive(pidPath)
+  local pid = readPid(pidPath)
+  if pid == nil then
+    return nil
+  end
+  return noctalia.fileExists("/proc/" .. tostring(pid)) == true
+end
+
+-- Delete *finished* job files older than maxAgeMs. A token counts as running only when it has no
+-- `.exit` file *and* the pid it recorded is still alive; only then are its files - including the
+-- fifo and the status file - protected from removal. A script killed before it could write `.exit`
+-- (power loss, a SIGKILLed script, a shell crash) leaves a dead pid behind, so its files age out
+-- like a finished job's instead of leaking forever. Without a readable, sane pid the old rule
+-- stands: no `.exit` means running, which is the only safe reading when the job may simply not have
+-- written its pid yet.
 function M.sweep(maxAgeMs)
   local dir = M.dataDir("jobs")
   if dir == nil then
@@ -311,14 +371,34 @@ function M.sweep(maxAgeMs)
   local now = noctalia.nowMs()
   local limit = maxAgeMs or 24 * 3600 * 1000
   local removed = 0
+
+  -- Liveness is decided once per token and before anything is removed. Testing it per file would be
+  -- order-dependent: once the `.pid` file itself has been swept, its siblings would look pid-less
+  -- and be kept forever by the fallback.
+  local runningTokens = {}
+  local function tokenRunning(token)
+    local cached = runningTokens[token]
+    if cached == nil then
+      if present[token .. ".exit"] == true then
+        -- The job wrote its exit code: nothing about it needs protecting any more.
+        cached = false
+      else
+        -- nil (no readable, sane pid) keeps the pre-0.2.0 rule: assume it is still running.
+        cached = pidAlive(dir .. "/" .. token .. ".pid") ~= false
+      end
+      runningTokens[token] = cached
+    end
+    return cached
+  end
+
   for _, name in ipairs(listing) do
     if type(name) == "string" then
       local path = dir .. "/" .. name
       local info = noctalia.fileInfo(path)
       if info ~= nil and not info.isDir then
         local token, suffix = name:match("^(.*)%.([^%.]+)$")
-        local running = token ~= nil and JOB_FILE_SUFFIXES[suffix] == true
-          and present[token .. ".exit"] ~= true
+        -- An unknown suffix is never a job file: age alone decides, with no liveness test at all.
+        local running = token ~= nil and JOB_FILE_SUFFIXES[suffix] == true and tokenRunning(token)
         if not running then
           local mtime = tonumber(info.mtime) or 0
           local age = mtime > 1e12 and (now - mtime) or (now - mtime * 1000)
