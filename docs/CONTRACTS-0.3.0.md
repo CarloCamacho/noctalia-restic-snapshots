@@ -26,17 +26,17 @@ feature release on top of it:
 **Environment.** The repository lives on the user's CachyOS box; you work there over SSH:
 
 ```bash
-ssh -F /opt/data/.ssh/config cachyos-ts 'bash -lc "cd /home/ian/work/.wt-<yours> && COMMAND"'
+ssh <box> 'bash -lc "cd the worktrees/.wt-<yours> && COMMAND"'
 ```
 
 - The remote login shell is **fish**, so always wrap remote commands in `bash -lc "..."`. For
   anything multi-line, compose the file locally and `scp` it to the box, then run it.
 - Your worktree is already created on your branch. **Work only there.** Never edit
-  `/home/ian/work/restic-snapshots` (the main checkout): the user's *running* shell loads that
+  `the plugin checkout` (the main checkout): the user's *running* shell loads that
   path and hot-reloads it. Never run `noctalia msg plugins enable/disable/source`.
 - Commit in your worktree. Never merge, rebase or push.
 - Gate — must be green when you finish, including your new tests:
-  `bash /tmp/restic-gate.sh /home/ian/work/.wt-<yours>`
+  `bash /tmp/restic-gate.sh the worktrees/.wt-<yours>`
 
 **Language.** Files are Luau but the suite runs them under **Lua 5.4**: `luac -p` must pass on
 everything you touch. No `continue`, no type annotations, no string interpolation, no compound
@@ -69,13 +69,13 @@ callbacks, which the host calls).
 
 ## 3. Live system you may test against
 
-The plugin is **configured and working** on the box: repository `/mnt/Media/backups`, password file
-`/mnt/Media/backups/passwd` (a path — never read it), backup path `/home/ian/cachyos-dotfiles`,
-restore target `/mnt/Media/restore`, tags `noctalia`, mode `plugin`, interval 60 min.
+The plugin is **configured and working** on the box: repository `<repository>`, password file
+`<password file>` (a path — never read it), backup path `<backup path>`,
+restore target `<restore target>`, tags `noctalia`, mode `plugin`, interval 60 min.
 
 Allowed: read-only restic commands with `--no-lock`; the service's safe IPC events
 (`refresh`, `backup-now`, `check`, `stats`, `ls`, `diff`, `forget-dry-run`, `restore-dry-run`,
-`restore`, `job-log`, `verify-restore` once it exists); writes **inside** `/mnt/Media/restore`.
+`restore`, `job-log`, `verify-restore` once it exists); writes **inside** `<restore target>`.
 Forbidden: `forget` without `--dry-run`, any `prune`, `unlock`, writing anywhere else on the box,
 and `noctalia msg plugins ...` management commands. Run IPC with:
 
@@ -91,12 +91,12 @@ refused with "a job is already running" — that is correct behaviour, not a bug
 
 | WS | Branch | Worktree | Owns (only these files) |
 |---|---|---|---|
-| V | `feat/verify` | `/home/ian/work/.wt-v` | `service.luau`, `lib/restic.luau`, `lib/schedule.luau`, `tests/lua/verify_test.lua` (new), `tests/test_restic.py` |
-| H | `feat/hooks` | `/home/ian/work/.wt-h` | `lib/jobs.luau`, `tests/lua/jobs_hooks_test.lua` (new), `tests/test_jobs_script.py` |
-| L | `feat/launcher` | `/home/ian/work/.wt-l` | `launcher.luau` (new), `tests/lua/launcher_test.lua` (new) |
-| P | `feat/panel-extras` | `/home/ian/work/.wt-p` | `panel.luau`, `widget.luau`, `tests/lua/panel_render_test.lua`, `tests/lua/widget_render_test.lua` |
-| M | `feat/metrics` | `/home/ian/work/.wt-m` | `lib/metrics.luau` (new), `tests/lua/metrics_test.lua` (new), `tests/test_metrics.py` (new) |
-| D | `docs/030` | `/home/ian/work/.wt-docs` | `README.md`, `CHANGELOG.md` |
+| V | `feat/verify` | `the worktrees/.wt-v` | `service.luau`, `lib/restic.luau`, `lib/schedule.luau`, `tests/lua/verify_test.lua` (new), `tests/test_restic.py` |
+| H | `feat/hooks` | `the worktrees/.wt-h` | `lib/jobs.luau`, `tests/lua/jobs_hooks_test.lua` (new), `tests/test_jobs_script.py` |
+| L | `feat/launcher` | `the worktrees/.wt-l` | `launcher.luau` (new), `tests/lua/launcher_test.lua` (new) |
+| P | `feat/panel-extras` | `the worktrees/.wt-p` | `panel.luau`, `widget.luau`, `tests/lua/panel_render_test.lua`, `tests/lua/widget_render_test.lua` |
+| M | `feat/metrics` | `the worktrees/.wt-m` | `lib/metrics.luau` (new), `tests/lua/metrics_test.lua` (new), `tests/test_metrics.py` (new) |
+| D | `docs/030` | `the worktrees/.wt-docs` | `README.md`, `CHANGELOG.md` |
 
 `plugin.toml`, `translations/en.json` and `lib/state.luau` are **already prepared** by the lead —
 do not edit them except where a line below explicitly assigns you one.

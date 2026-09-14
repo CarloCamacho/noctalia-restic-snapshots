@@ -36,12 +36,12 @@ job log viewer, single-snapshot forget, snapshot filtering, and a real restore f
 **Environment.** The repository lives on the user's CachyOS box and you reach it over SSH:
 
 ```bash
-ssh -F /opt/data/.ssh/config cachyos-ts 'bash -lc "cd /home/ian/work/.wt-<yours> && <cmd>"'
+ssh <box> 'bash -lc "cd the worktrees/.wt-<yours> && <cmd>"'
 ```
 
 - The remote **login shell is fish**, so always wrap remote commands in `bash -lc "..."`.
 - Your worktree is already created and checked out on your branch. **Work only there.**
-- Do **not** edit `/home/ian/work/restic-snapshots` (the main checkout): the user's *running*
+- Do **not** edit `the plugin checkout` (the main checkout): the user's *running*
   shell loads that directory through a path source and hot-reloads on change.
 - Do **not** run `noctalia msg plugins ...` (enable/disable/source). Live verification is the
   lead's job, after merge.
@@ -67,7 +67,7 @@ services/entries. Do not reformat or re-wrap code you are not changing. Keep dif
 **Testing — required, every workstream.**
 
 ```bash
-cd /home/ian/work/.wt-<yours>
+cd the worktrees/.wt-<yours>
 python3 -m unittest discover -s tests          # python: argv builders, parsers, schedule
 for f in tests/lua/*.lua; do lua5.4 "$f"; done # lua: real entries/renders driven by the harness
 luac -p plugin/restic-snapshots/*.luau plugin/restic-snapshots/lib/*.luau
@@ -93,11 +93,11 @@ another stub, ask for it in your report rather than editing the harness.
 
 | WS | Branch | Worktree | Owns (only these files) |
 |---|---|---|---|
-| A | `fix/jobs-core` | `/home/ian/work/.wt-a` | `plugin/restic-snapshots/lib/jobs.luau`, `tests/lua/jobs_test.lua` |
-| B | `feat/command-layer` | `/home/ian/work/.wt-b` | `plugin/restic-snapshots/lib/restic.luau`, `tests/test_restic.py` |
-| C | `feat/service-trust` | `/home/ian/work/.wt-c` | `plugin/restic-snapshots/service.luau`, `lib/schedule.luau`, `plugin.toml`, `tests/test_schedule.py`, `tests/lua/service_test.lua` |
-| D | `feat/panel-ux` | `/home/ian/work/.wt-d` | `plugin/restic-snapshots/panel.luau`, `widget.luau`, `shortcut.luau`, `tests/lua/panel_render_test.lua`, `tests/lua/widget_render_test.lua` |
-| E | `docs/packaging` | `/home/ian/work/.wt-e` | `README.md`, `CHANGELOG.md`, `catalog.toml` |
+| A | `fix/jobs-core` | `the worktrees/.wt-a` | `plugin/restic-snapshots/lib/jobs.luau`, `tests/lua/jobs_test.lua` |
+| B | `feat/command-layer` | `the worktrees/.wt-b` | `plugin/restic-snapshots/lib/restic.luau`, `tests/test_restic.py` |
+| C | `feat/service-trust` | `the worktrees/.wt-c` | `plugin/restic-snapshots/service.luau`, `lib/schedule.luau`, `plugin.toml`, `tests/test_schedule.py`, `tests/lua/service_test.lua` |
+| D | `feat/panel-ux` | `the worktrees/.wt-d` | `plugin/restic-snapshots/panel.luau`, `widget.luau`, `shortcut.luau`, `tests/lua/panel_render_test.lua`, `tests/lua/widget_render_test.lua` |
+| E | `docs/packaging` | `the worktrees/.wt-e` | `README.md`, `CHANGELOG.md`, `catalog.toml` |
 
 All five branch from `release/0.2.0`, which already contains the frozen interfaces:
 `lib/store.luau` (used by C), the new `lib/state.luau`, `plugin.toml`, `translations/en.json`

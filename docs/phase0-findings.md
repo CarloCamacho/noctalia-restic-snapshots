@@ -48,7 +48,7 @@ build can `pacman -S restic` and the plugin finds it either way.
 
 ## 4. Throwaway test fixture
 
-`/home/ian/work/.tools-build/restic-test/` — a repository, a `0600` password file, 200 KB of
+`the worktrees/.tools-build/restic-test/` — a repository, a `0600` password file, 200 KB of
 random data, and a staging restore directory. Used for the live end-to-end test below and
 removed afterwards; no real data was touched.
 
