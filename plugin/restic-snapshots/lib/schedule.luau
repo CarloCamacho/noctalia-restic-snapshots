@@ -42,4 +42,61 @@ function M.untilLabel(nowSec, nextRunSec)
   return string.format("in %dh", math.floor(delta / 3600))
 end
 
+-- ── staleness ────────────────────────────────────────────────────────────────
+-- Staleness is measured against the *repository*, not against our own last run, so it says
+-- something useful in observe mode too: if the newest snapshot is old, whoever was supposed to
+-- write it did not.
+
+-- Hours after which a repository counts as stale. An explicit setting wins; otherwise two
+-- backup intervals (a single missed run is a late backup, two is a missed one), with a floor of
+-- two hours so a 5-minute test interval does not flap.
+function M.staleThresholdHours(cfg)
+  local explicit = tonumber(cfg ~= nil and cfg.staleAfterHours or nil) or 0
+  if explicit > 0 then
+    return explicit
+  end
+  local intervalMinutes = tonumber(cfg ~= nil and cfg.intervalMinutes or nil) or 60
+  return math.max(2 * intervalMinutes / 60, 2)
+end
+
+-- Strictly older than the threshold: exactly at it is late, not yet stale. An unknown newest
+-- snapshot (empty repository, unreadable time) is never stale -- there is nothing to compare.
+function M.isStale(nowSec, newestSnapshotAt, thresholdHours)
+  local newest = tonumber(newestSnapshotAt)
+  local threshold = tonumber(thresholdHours)
+  if newest == nil or threshold == nil or threshold <= 0 then
+    return false
+  end
+  local now = tonumber(nowSec) or 0
+  return (now - newest) > threshold * 3600
+end
+
+-- ── integrity checks ─────────────────────────────────────────────────────────
+
+-- True when a scheduled check is due. A check that has never run is due, so switching the
+-- interval on in the settings takes effect instead of waiting out a whole interval.
+function M.checkDue(nowSec, lastCheckAt, intervalHours)
+  local interval = tonumber(intervalHours)
+  if interval == nil or interval <= 0 then
+    return false
+  end
+  local last = tonumber(lastCheckAt)
+  if last == nil then
+    return true
+  end
+  return tonumber(nowSec) >= last + interval * 3600
+end
+
+-- The `--read-data-subset` value for one slot of the rotation. `index` is a zero-based counter
+-- that wraps, so the series walks 1/total, 2/total ... total/total, 1/total ... and every part
+-- of the repository is read over time without ever reading all of it in one run.
+function M.subsetForIndex(index, total)
+  local size = math.floor(tonumber(total) or 0)
+  if size < 1 then
+    size = 1
+  end
+  local slot = math.floor(tonumber(index) or 0) % size + 1
+  return string.format("%d/%d", slot, size)
+end
+
 return M
