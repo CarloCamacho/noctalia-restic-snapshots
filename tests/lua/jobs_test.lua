@@ -112,6 +112,52 @@ check("env file is sourced single-quoted and exported",
 check("env file is sourced before restic runs",
   (envScript:find("set +a", 1, true) or 0) < (envScript:find("/x/restic", 1, true) or 0))
 
+-- ── script generation: cancellation reaches the whole job (0.3.0) ────────────
+-- The job is more than its restic process. While a pre-command runs there is no restic pid at all,
+-- so a cancel used to do nothing there, and a watchdog strike released the single-flight guard
+-- while the script - and its hook - stayed alive and went on to start restic unwatched. The script
+-- therefore records its own pid first and traps the signals the service sends.
+
+check("the script records its own pid", script:find('printf \'%s\' "$$" > "$shpidfile"', 1, true) ~= nil)
+check("the runner hands the script's pid path back",
+  type(paths.shpid) == "string" and paths.shpid:find("%.shpid$") ~= nil, tostring(paths.shpid))
+check("the script's pid is written after the umask and before the fifo exists",
+  (script:find("umask 077", 1, true) or 0) < (script:find('> "$shpidfile"', 1, true) or 0)
+    and (script:find('> "$shpidfile"', 1, true) or 0) < (script:find("mkfifo", 1, true) or 0))
+
+local trapLine = lineContaining(script, " TERM INT HUP")
+check("the script traps TERM, INT and HUP", trapLine ~= nil, tostring(trapLine))
+check("the trap kills the child running right now", trapLine ~= nil
+  and trapLine:find('kill -TERM "$child"', 1, true) ~= nil, tostring(trapLine))
+check("the trap removes the fifo", trapLine ~= nil
+  and trapLine:find('rm -f "$fifo"', 1, true) ~= nil, tostring(trapLine))
+check("the trap records the exit code, so the service sees the job end", trapLine ~= nil
+  and trapLine:find('> "$exitfile"', 1, true) ~= nil, tostring(trapLine))
+-- The trap is installed before the path variables are assigned, so every branch has to tolerate an
+-- unset variable: `rm -f ""` and `> ""` on a signal in that window would be shell errors.
+check("the trap tolerates the paths not being assigned yet",
+  trapLine ~= nil and trapLine:find('[ -n "$fifo" ]', 1, true) ~= nil
+    and trapLine:find('[ -n "$child" ]', 1, true) ~= nil, tostring(trapLine))
+check("the trap exits 143", trapLine ~= nil and trapLine:find("exit 143", 1, true) ~= nil, tostring(trapLine))
+-- `child` is what makes the trap reach a hook: it is set for restic's pid below, and for a hook's
+-- while one runs. A hook-free script leaves it empty rather than unset.
+check("the script starts with no child", script:find("\nchild=\n", 1, true) ~= nil)
+
+-- Armed before the pre-command runs, or a TERM during the hook would still be deferred.
+local hookToken, hookErr, hookPaths = jobs.start(argv, { preCommand = "echo staged" })
+check("a hook job starts", hookToken ~= nil, tostring(hookErr))
+local hookScript = ""
+if hookPaths ~= nil and type(hookPaths.script) == "string" then
+  hookScript = H.files[hookPaths.script] or ""
+end
+check("the trap is armed before the pre-command runs",
+  (hookScript:find(" TERM INT HUP", 1, true) or 0) > 0
+    and (hookScript:find(" TERM INT HUP", 1, true) or 0)
+      < (hookScript:find("sh -c \"$PRECOMMAND\"", 1, true) or 0),
+  tostring(hookScript:find(" TERM INT HUP", 1, true)))
+check("the hook job's script carries the pid write too",
+  hookScript:find('> "$shpidfile"', 1, true) ~= nil)
+
 -- ── polling ──────────────────────────────────────────────────────────────────
 
 local polled = jobs.poll(token, paths, nil)
@@ -224,7 +270,7 @@ local function addJobFile(name, mtime, contents, into)
 end
 
 -- A finished job: `.exit` exists, so every one of its files may age out.
-for _, suffix in ipairs({ "exit", "jsonl", "status", "pid", "sh", "fifo" }) do
+for _, suffix in ipairs({ "exit", "jsonl", "status", "pid", "shpid", "sh", "fifo" }) do
   addJobFile("done1." .. suffix, oldSec, suffix == "exit" and "0" or "x")
 end
 -- A running job: no `.exit` yet, so nothing of its may be removed.
@@ -239,9 +285,10 @@ addJobFile("stray.bak", oldSec, "junk")
 _G.noctalia.listDir = function() return listing end
 local removed = jobs.sweep(3600 * 1000)
 
-check("sweep removes every file of a finished job", removed == 7, tostring(removed))
+check("sweep removes every file of a finished job", removed == 8, tostring(removed))
 check("sweep removes the fifo", H.files[JOB_DIR .. "/done1.fifo"] == nil)
 check("sweep removes the status file", H.files[JOB_DIR .. "/done1.status"] == nil)
+check("sweep removes the script's own pid file too", H.files[JOB_DIR .. "/done1.shpid"] == nil)
 check("sweep keeps a running job's log and fifo",
   H.files[JOB_DIR .. "/live1.jsonl"] ~= nil and H.files[JOB_DIR .. "/live1.fifo"] ~= nil)
 check("sweep keeps fresh job files", H.files[JOB_DIR .. "/done2.jsonl"] ~= nil)
@@ -257,11 +304,11 @@ check("sweep is idempotent", jobs.sweep(3600 * 1000) == 0)
 local liveListing = {}
 
 -- Killed before `.exit`: nothing serves /proc/900001.
-for _, suffix in ipairs({ "jsonl", "status", "pid", "sh", "fifo" }) do
+for _, suffix in ipairs({ "jsonl", "status", "pid", "shpid", "sh", "fifo" }) do
   addJobFile("dead1." .. suffix, oldSec, suffix == "pid" and "900001" or "x", liveListing)
 end
 -- Genuinely running: the stub below reports /proc/4242 as existing, so none of its files may go.
-for _, suffix in ipairs({ "jsonl", "status", "pid", "sh", "fifo" }) do
+for _, suffix in ipairs({ "jsonl", "status", "pid", "shpid", "sh", "fifo" }) do
   addJobFile("live2." .. suffix, oldSec, suffix == "pid" and "4242\n" or "x", liveListing)
 end
 -- An unknown suffix is still aged out on mtime alone, whatever the pids around it are doing.
@@ -298,16 +345,16 @@ local liveRemoved = jobs.sweep(3600 * 1000)
 local spawnedBySweep = #H.commands - spawnedBefore
 _G.noctalia.fileExists = originalFileExists
 
-check("sweep removes exactly the dead tokens' files", liveRemoved == 8, tostring(liveRemoved))
+check("sweep removes exactly the dead tokens' files", liveRemoved == 9, tostring(liveRemoved))
 check("a token whose pid is gone is swept despite the missing .exit file",
   H.files[JOB_DIR .. "/dead1.jsonl"] == nil and H.files[JOB_DIR .. "/dead1.fifo"] == nil)
-check("a dead token's status, pid and script files go too",
+check("a dead token's status, pid, script and script-pid files go too",
   H.files[JOB_DIR .. "/dead1.status"] == nil and H.files[JOB_DIR .. "/dead1.pid"] == nil
-    and H.files[JOB_DIR .. "/dead1.sh"] == nil)
+    and H.files[JOB_DIR .. "/dead1.sh"] == nil and H.files[JOB_DIR .. "/dead1.shpid"] == nil)
 check("a token whose pid is alive keeps every file",
   H.files[JOB_DIR .. "/live2.jsonl"] ~= nil and H.files[JOB_DIR .. "/live2.fifo"] ~= nil
     and H.files[JOB_DIR .. "/live2.status"] ~= nil and H.files[JOB_DIR .. "/live2.sh"] ~= nil
-    and H.files[JOB_DIR .. "/live2.pid"] ~= nil)
+    and H.files[JOB_DIR .. "/live2.pid"] ~= nil and H.files[JOB_DIR .. "/live2.shpid"] ~= nil)
 check("an old file with an unknown suffix is still swept", H.files[JOB_DIR .. "/unknownthing.weird"] == nil)
 check("a pid outside the sane range falls back to the old no-exit rule",
   H.files[JOB_DIR .. "/pidone.jsonl"] ~= nil and H.files[JOB_DIR .. "/pidone.pid"] ~= nil)
@@ -334,6 +381,53 @@ check("cancel uses kill -TERM with the pid as one argument",
 
 H.files[paths.pid] = ""
 check("cancel without a pid does nothing", jobs.cancel(paths) == false)
+
+-- ── cancellation reaches the script, not only restic (0.3.0) ────────────────
+
+-- The script's own pid is the one that exists in every phase - it is the only pid there is while a
+-- hook runs - so it is the one to signal. restic's pid remains the fallback for a job whose script
+-- has not written `.shpid` yet (and for tools that only know the 0.2.0 paths).
+H.commands = {}
+H.files[paths.shpid] = "4242\n"
+H.files[paths.pid] = "5151\n"
+check("cancel signals the job script when it has a pid", jobs.cancel(paths) == true)
+local shKill = H.commands[#H.commands]
+check("cancel prefers the script's pid over restic's", shKill ~= nil and #shKill == 3
+  and shKill[1] == "kill" and shKill[2] == "-TERM" and shKill[3] == "4242",
+  shKill and table.concat(shKill, " "))
+check("the KILL escalation uses the same pid", jobs.signal(paths, "KILL") == true
+  and H.commands[#H.commands][3] == "4242", table.concat(H.commands[#H.commands], " | "))
+
+-- An unusable script pid must not shadow a good restic pid: the fallback is what keeps a cancel
+-- from silently doing nothing.
+for _, bad in ipairs({ "", "not-a-pid", "1", "   ", "4242 9999" }) do
+  H.files[paths.shpid] = bad
+  H.commands = {}
+  check("an unusable script pid (" .. string.format("%q", bad) .. ") falls back to restic's pid",
+    jobs.cancel(paths) == true and H.commands[#H.commands][3] == "5151",
+    H.commands[#H.commands] and table.concat(H.commands[#H.commands], " "))
+end
+H.files[paths.shpid] = nil
+
+-- ── a token cannot repeat inside one process (0.3.0) ────────────────────────
+
+-- Two jobs started in the same millisecond used to draw the same seed, and therefore the same
+-- token: they shared one log, one exit file, one generated script. The monotonic counter makes
+-- that impossible whatever the clock says.
+H.nowMs = 1788874602000
+local firstToken = jobs.newToken()
+local secondToken = jobs.newToken()
+check("two tokens minted in the same millisecond differ", firstToken ~= secondToken,
+  tostring(firstToken) .. " vs " .. tostring(secondToken))
+local tokenA, tokenAErr, tokenPathsA = jobs.start(argv, nil)
+local tokenB, tokenBErr, tokenPathsB = jobs.start(argv, nil)
+check("two jobs started in the same millisecond get separate files",
+  tokenA ~= nil and tokenB ~= nil and tokenA ~= tokenB
+    and tokenPathsA.log ~= tokenPathsB.log and tokenPathsA.script ~= tokenPathsB.script
+    and tokenPathsA.shpid ~= tokenPathsB.shpid,
+  tostring(tokenAErr) .. " " .. tostring(tokenA) .. " vs " .. tostring(tokenB))
+check("a token is still a plain file name", tokenA ~= nil and tokenA:match("^[0-9a-f]+$") ~= nil,
+  tostring(tokenA))
 
 -- ── cancellation escalation: M.signal ────────────────────────────────────────
 -- The service sends TERM first and escalates to KILL after a grace period. Both go through

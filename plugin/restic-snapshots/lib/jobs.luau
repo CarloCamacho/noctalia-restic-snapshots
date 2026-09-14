@@ -6,7 +6,10 @@
 -- timeout), writing:
 --   <pluginDataDir>/jobs/<token>.jsonl    every non-status line of restic's output (the job log)
 --   <pluginDataDir>/jobs/<token>.status   restic's newest --json status line, overwritten in place
---   <pluginDataDir>/jobs/<token>.pid      restic's own pid (for cancellation)
+--   <pluginDataDir>/jobs/<token>.pid      restic's own pid (0.2.0's cancellation target)
+--   <pluginDataDir>/jobs/<token>.shpid    the job script's own pid (0.3.0: cancel signals this
+--                                         one first - it is the only pid that exists while a
+--                                         pre/post-backup hook runs)
 --   <pluginDataDir>/jobs/<token>.exit     restic's exit code, written when it exits
 -- The service polls `.exit`, parses the log for the final summary, and reads `.status` for
 -- progress. 0.2.0 splits the two: status lines used to be re-parsed out of the log every tick.
@@ -38,9 +41,26 @@ local JOB_FILE_SUFFIXES = {
   status = true,
   exit = true,
   pid = true,
+  shpid = true,
   sh = true,
   fifo = true,
 }
+
+-- [0.3.0] What a job script does when it is signalled: kill the child running right now - restic,
+-- or the hook during the pre/post phase - drop the fifo, record 143 and leave. Before this a TERM
+-- only ever reached restic, so a job whose pre-command was running had no pid to signal at all,
+-- and a watchdog strike released the single-flight guard while the script - and its hook - stayed
+-- alive and went on to start restic unwatched.
+--
+-- `.exit` is written here (only when the job has not finished on its own) so the service's next
+-- poll sees the cancellation and finishes the job with the code the signal produced, instead of
+-- holding the guard until its own escalation runs out. Every branch tolerates an unset variable:
+-- the trap is installed before the paths are assigned, so a signal in that window must not run
+-- `rm -f ""` or `> ""`.
+local TRAP_ACTION = "if [ -n \"$child\" ]; then kill -TERM \"$child\" 2>/dev/null; fi; "
+  .. "if [ -n \"$fifo\" ]; then rm -f \"$fifo\"; fi; "
+  .. "if [ -n \"$exitfile\" ] && [ ! -e \"$exitfile\" ]; then echo 143 > \"$exitfile\"; fi; "
+  .. "exit 143"
 
 -- What the last poll handed out per token. The service only passes the *log* size back and the
 -- status file is overwritten in place, so "did the status file change?" is not answerable from
@@ -62,9 +82,17 @@ function M.dataDir(sub)
   return dir
 end
 
+-- [0.3.0] A token must be unique within the process, not merely likely to be: seeding math.random
+-- from the clock in milliseconds means two jobs started in the same millisecond draw the same seed
+-- and therefore the same number, and both jobs would then share one log, one exit file and one
+-- generated script (the verify workstream hit exactly that in its tests, where time is frozen).
+-- The counter is monotonic and cannot repeat, so the seed only has to make a token unguessable.
+local tokenCounter = 0
+
 function M.newToken()
+  tokenCounter = tokenCounter + 1
   math.randomseed(noctalia.nowMs() % 2147483647)
-  return string.format("%x%x", noctalia.nowMs(), math.random(0, 0xFFFFFF))
+  return string.format("%x%x%x", noctalia.nowMs(), math.random(0, 0xFFFFFF), tokenCounter)
 end
 
 -- Decode one restic status line. restic.luau owns the status JSON shape; the plain decode is a
@@ -103,6 +131,7 @@ function M.start(argv, opts)
   local statusPath = dir .. "/" .. token .. ".status"
   local exitPath = dir .. "/" .. token .. ".exit"
   local pidPath = dir .. "/" .. token .. ".pid"
+  local shpidPath = dir .. "/" .. token .. ".shpid"
   local scriptPath = dir .. "/" .. token .. ".sh"
   local fifoPath = dir .. "/" .. token .. ".fifo"
 
@@ -133,6 +162,16 @@ function M.start(argv, opts)
     '# log file it creates 0600 as well.',
     'chmod 600 "$0" 2>/dev/null || true',
     "umask 077",
+    -- [0.3.0] The script's own pid, written before anything else runs, so cancellation reaches the
+    -- whole job and not just restic: a pre-command phase has no restic pid at all (cancel used to
+    -- do nothing there), and a job the watchdog struck down must not keep the script - and its
+    -- hook - alive to start restic unwatched afterwards.
+    "shpidfile=" .. restic.shellQuote(shpidPath),
+    'printf \'%s\' "$$" > "$shpidfile"',
+    -- `child` is the one variable the trap can see in every phase; it holds restic's pid once
+    -- restic is up and the running hook's pid while a hook runs.
+    "child=",
+    "trap " .. restic.shellQuote(TRAP_ACTION) .. " TERM INT HUP",
   }
   if opts.pathPrefix and opts.pathPrefix ~= "" then
     local parts = { opts.pathPrefix, "/usr/local/bin", "/usr/bin", "/bin" }
@@ -170,9 +209,16 @@ function M.start(argv, opts)
   -- behind a marker line so the Log tab shows them, and a non-zero status aborts the job before
   -- restic is ever started - the fifo is removed again, the abort status becomes the job's result
   -- and the script exits with it. Without a hook not one of these lines is emitted.
+  --
+  -- Backgrounded and then waited for, rather than run in the foreground: while a foreground child
+  -- runs, `sh` defers a signal trap until that child finishes, so a TERM could not reach a hook at
+  -- all. `wait` restores the old ordering and the old exit code, while `child=$!` is what makes
+  -- the hook reachable by the trap.
   if preCommand ~= nil then
     table.insert(lines, "printf '%s\\n' '== pre-backup command ==' >> \"$logfile\"")
-    table.insert(lines, '/bin/sh -c "$PRECOMMAND" >> "$logfile" 2>&1')
+    table.insert(lines, '/bin/sh -c "$PRECOMMAND" >> "$logfile" 2>&1 &')
+    table.insert(lines, "child=$!")
+    table.insert(lines, 'wait "$child"')
     table.insert(lines, "prestatus=$?")
     table.insert(lines, 'if [ "$prestatus" -ne 0 ]; then')
     table.insert(lines, "  printf '%s\\n' 'the pre-backup command failed; restic was not started' >> \"$logfile\"")
@@ -200,9 +246,15 @@ function M.start(argv, opts)
     -- it stays inside the job's lifetime and its output stays in the job's log. `resticexit`
     -- captures restic's status before the hook starts: the hook sees it as RESTIC_EXIT, and the
     -- code finally recorded in `.exit` is restic's again, never the hook's own.
+    --
+    -- Backgrounded and waited for like the pre-command, so a TERM that arrives while the hook
+    -- runs reaches it: a hung post-command used to be unkillable, and the job would only look
+    -- finished after the watchdog's kill while the hook kept running.
     table.insert(lines, "resticexit=$?")
     table.insert(lines, "printf '%s\\n' '== post-backup command ==' >> \"$logfile\"")
-    table.insert(lines, 'RESTIC_EXIT="$resticexit" /bin/sh -c "$POSTCOMMAND" >> "$logfile" 2>&1')
+    table.insert(lines, 'RESTIC_EXIT="$resticexit" /bin/sh -c "$POSTCOMMAND" >> "$logfile" 2>&1 &')
+    table.insert(lines, "child=$!")
+    table.insert(lines, 'wait "$child"')
     table.insert(lines, 'printf \'%s\' "$resticexit" > "$exitfile"')
   end
   table.insert(lines, 'rm -f "$fifo"')
@@ -223,6 +275,7 @@ function M.start(argv, opts)
     status = statusPath,
     exit = exitPath,
     pid = pidPath,
+    shpid = shpidPath,
     script = scriptPath,
     fifo = fifoPath,
   }
@@ -258,10 +311,15 @@ local function readPid(pidPath)
   return pid
 end
 
--- Signal a running job's restic process. Returns true when the signal was accepted, plus an error
--- string otherwise. This is the single place that reads and validates a pid, so an escalation
--- (TERM, then KILL) cannot drift from the first attempt. Kill's argv is built here and nowhere else,
--- and only `ALLOWED_SIGNALS` members can reach it.
+-- Signal a running job. Returns true when the signal was accepted, plus an error string otherwise.
+--
+-- [0.3.0] The *script's* pid (`.shpid`) is preferred over restic's own (`.pid`): a job is more than
+-- its restic process - the pre-command phase has no restic pid at all, and the script's trap is
+-- what kills whichever child is running and cleans the fifo up. `.pid` stays the fallback for a
+-- job whose script has not written `.shpid` yet, and for the tests and tools that only know 0.2.0
+-- paths. This is the single place that reads and validates a pid, so an escalation (TERM, then
+-- KILL) cannot drift from the first attempt. Kill's argv is built here and nowhere else, and only
+-- `ALLOWED_SIGNALS` members can reach it.
 function M.signal(paths, signalName)
   if type(paths) ~= "table" then
     return false, "no job to signal"
@@ -269,7 +327,7 @@ function M.signal(paths, signalName)
   if ALLOWED_SIGNALS[signalName] ~= true then
     return false, "unsupported signal"
   end
-  local pid = readPid(paths.pid)
+  local pid = readPid(paths.shpid) or readPid(paths.pid)
   if pid == nil then
     return false, "no usable pid"
   end
@@ -279,7 +337,8 @@ function M.signal(paths, signalName)
   return true, nil
 end
 
--- Terminate a running job's restic process. Returns true when a signal was sent.
+-- Terminate a running job (0.3.0: its script, falling back to restic - see M.signal). Returns true
+-- when a signal was sent.
 function M.cancel(paths)
   local ok = M.signal(paths, "TERM")
   return ok == true
