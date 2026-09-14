@@ -118,17 +118,17 @@ file** and one backup path. Nothing runs before those are set. A working startin
 
 | Setting | Example value |
 | --- | --- |
-| `repository` | `/mnt/Media/backups` (a local path) or `sftp:host:/srv/restic` |
-| `password_file` | `/mnt/Media/backups/passwd` |
-| `backup_paths` | `/home/you/cachyos-dotfiles` |
+| `repository` | `/srv/restic-repo` (a local path) or `sftp:host:/srv/restic` |
+| `password_file` | `/etc/restic/passwd` |
+| `backup_paths` | `/home/you/dotfiles` |
 | `backup_tags` | `["noctalia"]` (the default) |
 | `interval_minutes` | `60` (the default) |
-| `restore_target` | `/mnt/Media/restore` |
+| `restore_target` | `/mnt/restore` |
 
 **The password file holds the repository password in plain text, and the plugin never reads it,
 checks it or changes its mode.** That is on purpose — it is also the one thing about this plugin you
 have to get right yourself: `chmod 600` the file. A password file at mode `644` (which is what the
-reference machine's `/mnt/Media/backups/passwd` was when this was written) is a plain-text secret
+reference machine's `/etc/restic/passwd` was when this was written) is a plain-text secret
 readable by every account on the box, and the repository is only as private as that file. The
 plugin's only use of it is `--password-file <path>`, so nothing else about the setup changes when
 you tighten the mode. If the repository is remote, prefer an `env_file` with a scoped credential
@@ -235,7 +235,7 @@ verify_file_count = 3
 
 That is the whole configuration. The Run tab then shows a *Last verified* line reading, for example,
 `3 of 3 files matched`, and on a failing run the reason — `1 of 3 checked files do not match the
-backup: /home/you/cachyos-dotfiles/…: the backup does not match the live file`.
+backup: /home/you/dotfiles/…: the backup does not match the live file`.
 
 Run one now, without waiting for the cadence:
 
@@ -243,13 +243,13 @@ Run one now, without waiting for the cadence:
 export XDG_RUNTIME_DIR=/run/user/$(id -u); export WAYLAND_DISPLAY=wayland-1
 noctalia msg plugin carlocamacho/restic-snapshots:service all verify-restore
 # a scratch directory somewhere else inside an allowed restore root:
-noctalia msg plugin carlocamacho/restic-snapshots:service all verify-restore '{"target":"/mnt/Media/restore"}'
+noctalia msg plugin carlocamacho/restic-snapshots:service all verify-restore '{"target":"/mnt/restore"}'
 ```
 
 The result lands in the published status as `verify` (`lastAt`, `lastOk`, `checked`, `matched`,
 `failed`, `detail`), which is what the panel, the widget and the metrics export read. With the
-settings above and a restore target of `/mnt/Media/restore`, a run at epoch `1789397000` restores
-into `/mnt/Media/restore/.verify/1789397000/home/you/cachyos-dotfiles/…`, compares the files, and
+settings above and a restore target of `/mnt/restore`, a run at epoch `1789397000` restores
+into `/mnt/restore/.verify/1789397000/home/you/dotfiles/…`, compares the files, and
 then removes those restored files, leaving the empty `.verify/1789397000/…` directory tree behind
 (deliberately — see [Limitations](#limitations--things-that-are-deliberately-not-done)).
 
