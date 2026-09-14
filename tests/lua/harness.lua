@@ -206,6 +206,15 @@ function H.install(plugin_dir)
     setEnabled = function(v) H.shortcutEnabled = v end,
   }
 
+  -- Launcher provider: captures what onQuery published and any query rewrite.
+  _G.launcher = {
+    setResults = function(query, results)
+      H.launcherQuery = query
+      H.launcherResults = results
+    end,
+    setQuery = function(text) H.launcherSetQuery = text end,
+  }
+
   local realRequire = require
   _G.require = function(name)
     if type(name) == "string" and name:sub(1, 2) == "./" then

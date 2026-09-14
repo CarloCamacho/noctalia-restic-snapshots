@@ -62,6 +62,7 @@ function M.emptyStatus()
     staleness = nil,          -- hours since the newest snapshot; nil until known
     stale = false,            -- staleness passed the configured threshold
     checks = nil,             -- { lastAt, lastOk, numErrors }
+    verify = nil,             -- { lastAt, lastOk, checked, matched, failed, detail }
     initNeeded = false,       -- repository reachable but not initialised yet
     error = "",               -- last failure message shown in the panel/widget
   }
