@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.6.1 — 2026-09-15
+
+### Fixed
+
+- **The prune confirmation could be pushed out of reach.** The Retention tab built one flat column —
+  policy, preview button, counts, note, up to twenty rows of the snapshots that would be removed, then
+  the *Prune now* button — and the panel's root column does not scroll. Every other tab bounds its own
+  body in a `ui.scroll`; this one did not. With sixteen snapshots to remove the rows ran past the
+  panel's fixed 820×620 and took the truncation notice and the button with them: the note above said
+  *confirm below*, and there was no way to reach below. Reported from a real panel — 16 to remove, 12
+  rows visible, no button — which meant the confirmation for an **irreversible** action was
+  unreachable whenever the removal list was long enough to overflow.
+
+  The list now scrolls inside `removal-scroll` and the confirmation is appended after it, so no list
+  length can push it off the bottom. The counts, the note and the list heading stay pinned above it.
+
+  Guarded by a structural test rather than a pixel one: `panel_render_test` renders a full twenty-row
+  list and asserts the rows are inside a scroll and the prune button is **not** inside it. The harness
+  has no layout engine, so a test that merely asserted "the button renders" passes even when the button
+  is off-screen — the assertion has to be about nesting.
+
 ## 0.6.0 — 2026-09-15
 
 The Log tab release. 0.5.0 gave the Snapshots tab something to say; the Log tab still said one line —

@@ -12,7 +12,7 @@
 id          = "carlocamacho/restic-snapshots"
 name        = "Restic Snapshots"
 icon        = "archive"
-version     = "0.6.0"
+version     = "0.6.1"
 plugin_api  = 30
 author      = "carlocamacho"
 license     = "MIT"
