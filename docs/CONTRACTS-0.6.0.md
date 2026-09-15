@@ -114,10 +114,21 @@ Two new fixtures, both **real** captures from restic 0.19.1 against a throwaway 
 empty `item` and a positive `total_files`; the fixture carries both files and directories), so a
 regenerated fixture cannot quietly weaken the lua expectations.
 
-### One production check left to the scheduler
+### The live progress path, checked on a real job (not a probe)
 
 The `.status` file was empty on every short backup reproduced during this work — including before the
-change, on runs under a second — so `--verbose`'s effect on it cannot be shown from a probe. The
-routing is unchanged and restic's message types are independent, but **the next scheduled backup is
-the real check**: `.status` should still hold a `status` line and the Run tab should still show
-progress.
+change, on runs under a second — so `--verbose`'s effect on it could not be shown from a probe. A real
+job was dispatched (`noctalia msg plugin carlocamacho/restic-snapshots:service all backup-now`) and the
+answer is that nothing moved:
+
+```
+new job log   1a0a5180009fef60a1.jsonl     668 bytes / 2 lines   (was 472 bytes / 1 line)
+  actions:      1 scan_finished          message types: 1 verbose_status, 1 summary
+.status       119 bytes
+  {"message_type":"status","percent_done":1,"total_files":173,"files_done":173,
+   "total_bytes":860367,"bytes_done":860367}
+```
+
+The generated script for that job ran
+`... backup /home/ian/cachyos-dotfiles --json --verbose --tag noctalia`. So `--verbose` adds records
+without disturbing the routing, and the Run tab's progress still reads the last `status` line.

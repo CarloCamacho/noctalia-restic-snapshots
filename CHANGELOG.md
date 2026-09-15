@@ -44,8 +44,10 @@ job log a record of what the run did.
   writes one line per file; an unchanged hourly run writes two. The panel already bounds its read to
   the last 16 KB / 200 rows, and the jobs directory is swept after a day, so neither the read nor the
   render is proportional to a large log — the failure mode 0.4.0 fixed.
-- **`--verbose` does not disturb the live progress path.** The `.status` routing is unchanged and
-  restic's message types are independent; the Run tab's progress still reads the last `status` line.
+- **`--verbose` does not disturb the live progress path.** Verified on a real dispatched job, not a
+  probe: the generated script ran `backup ... --json --verbose --tag noctalia`, the log went from 472
+  bytes / 1 line to 668 bytes / 2 lines, and `.status` still held its `status` line
+  (`percent_done: 1, files_done: 173`), so the Run tab's progress is unchanged.
 
 ## 0.5.0 — 2026-09-15
 
