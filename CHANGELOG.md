@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.6.3 — 2026-09-15
+
+### Fixed
+
+- **The diff header ran off the right edge of the panel.** It put two full 64-character snapshot ids in
+  one label with no width bound, so the line reached the panel's edge and kept going — reported from a
+  real panel, where the trailing `:` was the last thing that fit. The header now quotes restic's short
+  form: the first eight characters, which is what every other surface in this plugin already shows as
+  `shortId` and what restic's own tooling prints. The whole id stays on the snapshot's details card.
+
+- **`maxLines = 1` does not stop horizontal overflow, and three more labels were relying on it.** A
+  label takes its **natural** width unless something makes it fill the row, and a path, a hash or a
+  comma-joined tag list has no break opportunity — so `maxLines = 1` clamps nothing, the `ui.spacer`
+  beside it collapses to zero, and whatever sat to its right is pushed off the edge with it. Fixed in
+  the three places that carry unbounded content:
+
+  - the diff's changed-path labels now fill the row (`flexGrow`) and clamp at the edge;
+  - the file listing's path label does the same, which also keeps its size column right-aligned;
+  - a snapshot row's tag list is capped, since tags are user-authored and unbounded in principle.
+
+  Guarded by tests that assert the **bound** rather than the look. The harness has no layout engine, so
+  no assertion can see an overflow; what can be asserted is that the constraint preventing one is
+  present — `flexGrow` or `maxWidth` on every label that shares a row with something else.
+
 ## 0.6.2 — 2026-09-15
 
 ### Fixed
