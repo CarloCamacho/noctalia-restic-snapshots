@@ -11,8 +11,8 @@
 [[plugin]]
 id           = "carlocamacho/restic-snapshots"
 name         = "Restic Snapshots"
-version      = "0.6.1"
-updated_at   = 1789479386
+version      = "0.6.2"
+updated_at   = 1789480093
 added_at     = 1789392236
 author       = "carlocamacho"
 license      = "MIT"

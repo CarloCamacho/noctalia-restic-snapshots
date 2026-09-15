@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.6.2 — 2026-09-15
+
+### Fixed
+
+- **The retention preview outlived the prune it acted on.** Confirming a prune left the list on
+  screen, still naming the snapshots that had just been removed, with the *Prune now* button still
+  armed. That is worse than stale text: it offers a second prune of snapshots that no longer exist,
+  against counts nothing had recomputed. Reported as *"once you hit Prune and confirm, it doesn't
+  clear the preview list"*.
+
+  A `forget` finishing now re-runs the dry run, so the preview is re-stated against the repository as
+  it now is. Measured on a throwaway repository holding ten snapshots under `keep-last 3`: the preview
+  reads **`keep 3, remove 7`** before confirming and **`keep 3, remove 0`** after, with three
+  snapshots left — and a `remove 0` preview draws no list and no button, so the panel reports the
+  policy satisfied rather than offering anything further. The panel also clears the stale list the
+  moment you confirm, so it never sits there armed for the length of the job.
+
+### Notes
+
+- The re-run is **unconditional, not success-only**. When a prune fails nothing was removed, and the
+  fresh run is what shows that, where the old counts would sit there claiming otherwise. The forget's
+  own error message is carried across the restart, so a failed prune cannot lose its explanation to a
+  preview that merely started.
+- It runs at the very end of the job, because `startJob` refuses while a job is still active and
+  `activeJob` is only cleared there.
+- `forget-one` — forgetting a single snapshot from its action sheet — triggers the same re-run. It
+  changes the snapshot set, so any preview on screen is stale in exactly the same way.
+
 ## 0.6.1 — 2026-09-15
 
 ### Fixed
