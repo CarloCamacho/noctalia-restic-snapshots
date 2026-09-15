@@ -12,7 +12,7 @@
 id          = "carlocamacho/restic-snapshots"
 name        = "Restic Snapshots"
 icon        = "archive"
-version     = "0.4.0"
+version     = "0.5.0"
 plugin_api  = 30
 author      = "carlocamacho"
 license     = "MIT"
@@ -212,41 +212,12 @@ description_key = "settings.metrics_dir.description"
 default         = ""
 advanced        = true
 
-# The panel's placement and position are read by the SHELL, not by the plugin: the host resolves
-# "<panel entry id>_placement" / "_position" when it opens a plugin panel, and injects its own
-# unlabelled fields when the plugin does not declare them. Declaring both gives the user a labelled
-# option in the plugin's settings. Valid values are exactly the ones below (see
-# plugin_panel_shell.cpp: panelPlacementFromString accepts "attached"/"floating", and the position
-# list is kPanelPositions).
-[[setting]]
-key             = "browser_placement"
-type            = "select"
-label_key       = "settings.browser_placement.label"
-description_key = "settings.browser_placement.description"
-default         = "floating"
-options = [
-  { value = "floating", label_key = "settings.browser_placement.floating" },
-  { value = "attached", label_key = "settings.browser_placement.attached" },
-]
-
-[[setting]]
-key             = "browser_position"
-type            = "select"
-label_key       = "settings.browser_position.label"
-description_key = "settings.browser_position.description"
-default         = "center"
-options = [
-  { value = "auto",          label_key = "settings.browser_position.auto" },
-  { value = "center",        label_key = "settings.browser_position.center" },
-  { value = "top_left",      label_key = "settings.browser_position.top_left" },
-  { value = "top_center",    label_key = "settings.browser_position.top_center" },
-  { value = "top_right",     label_key = "settings.browser_position.top_right" },
-  { value = "center_left",   label_key = "settings.browser_position.center_left" },
-  { value = "center_right",  label_key = "settings.browser_position.center_right" },
-  { value = "bottom_left",   label_key = "settings.browser_position.bottom_left" },
-  { value = "bottom_center", label_key = "settings.browser_position.bottom_center" },
-  { value = "bottom_right",  label_key = "settings.browser_position.bottom_right" },
-]
+# NOTE: browser_placement and browser_position are declared on the [[panel]] ENTRY below, as
+# [[panel.setting]], not here. plugin_panel_shell.cpp only suppresses its own standard fields when
+# the ENTRY already declares that key (hasSettingKey inspects entry.settings), so a plugin-level
+# copy is not recognised as a declaration: the host injected browser_placement anyway, the entry
+# value then shadowed the plugin-level one, and plugin_manifest.cpp warned on every single load.
+# Declaring them on the entry keeps the labelled control and removes the collision.
 
 [[service]]
 id    = "service"
@@ -291,3 +262,37 @@ placement                = "floating"
 position                 = "center"
 keyboard_focus           = "exclusive"
 dismiss_on_outside_click = true
+
+  # Declared on the entry so the host does not inject its own unlabelled copies of the same keys.
+  # Without a label the option existed but could not be found in Settings (the 0.4.0 report), and
+  # declaring it at plugin level instead produced a shadow warning on every load. The defaults
+  # match the placement/position keys above.
+  [[panel.setting]]
+  key             = "browser_placement"
+  type            = "select"
+  label_key       = "settings.browser_placement.label"
+  description_key = "settings.browser_placement.description"
+  default         = "floating"
+  options = [
+    { value = "floating", label_key = "settings.browser_placement.floating" },
+    { value = "attached", label_key = "settings.browser_placement.attached" },
+  ]
+
+  [[panel.setting]]
+  key             = "browser_position"
+  type            = "select"
+  label_key       = "settings.browser_position.label"
+  description_key = "settings.browser_position.description"
+  default         = "center"
+  options = [
+    { value = "auto",          label_key = "settings.browser_position.auto" },
+    { value = "center",        label_key = "settings.browser_position.center" },
+    { value = "top_left",      label_key = "settings.browser_position.top_left" },
+    { value = "top_center",    label_key = "settings.browser_position.top_center" },
+    { value = "top_right",     label_key = "settings.browser_position.top_right" },
+    { value = "center_left",   label_key = "settings.browser_position.center_left" },
+    { value = "center_right",  label_key = "settings.browser_position.center_right" },
+    { value = "bottom_left",   label_key = "settings.browser_position.bottom_left" },
+    { value = "bottom_center", label_key = "settings.browser_position.bottom_center" },
+    { value = "bottom_right",  label_key = "settings.browser_position.bottom_right" },
+  ]
