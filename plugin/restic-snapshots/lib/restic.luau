@@ -304,6 +304,12 @@ function M.backupArgs(cfg, binPath)
     table.insert(argv, path)
   end
   table.insert(argv, "--json")
+  -- [0.6.0] One verbose_status record per file and per directory. Without it `backup --json` writes
+  -- a SINGLE summary object for a run that copies nothing -- 473 bytes, identical every hour -- so
+  -- the Log tab had nothing to show and nothing anywhere named a file. The job script drops the
+  -- `unchanged` records, so the log keeps the short list of what this run actually did. Only backup
+  -- asks for it: it is the only command with per-file actions worth recording.
+  table.insert(argv, "--verbose")
   for _, tag in ipairs(cfg.tags) do
     table.insert(argv, "--tag")
     table.insert(argv, tag)

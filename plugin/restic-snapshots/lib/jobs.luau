@@ -138,6 +138,13 @@ function M.start(argv, opts)
   -- `case` pattern matching one restic --json status line; the double quotes are literal, so the
   -- whole pattern is single-quoted for the shell.
   local statusPattern = "*'\"message_type\":\"status\"'*"
+  -- [0.6.0] `backup --json --verbose` emits one verbose_status per file and per directory, and the
+  -- `unchanged` ones are the overwhelming majority of a quiet run -- 261 of 262 records on a no-op
+  -- hourly backup. They say nothing the summary does not, so they are dropped HERE, in the job
+  -- script, rather than filtered after the fact: a quiet run's log stays a handful of lines and the
+  -- panel never reads or formats them. A path cannot spoof the match (JSON escapes the quotes in a
+  -- path), so this arm can only ever match restic's own field.
+  local unchangedPattern = "*'\"action\":\"unchanged\"'*"
 
   -- [0.3.0] Pre/post-backup hooks are *user-supplied shell strings*, the one thing here that is
   -- neither an argv vector nor a path. They never reach a command line: each is written into the
@@ -234,6 +241,7 @@ function M.start(argv, opts)
   table.insert(lines, "while IFS= read -r line; do")
   table.insert(lines, "  case \"$line\" in")
   table.insert(lines, "    " .. statusPattern .. ") printf '%s\\n' \"$line\" > \"$statusfile\" ;;")
+  table.insert(lines, "    " .. unchangedPattern .. ") : ;;")
   table.insert(lines, "    *) printf '%s\\n' \"$line\" >> \"$logfile\" ;;")
   table.insert(lines, "  esac")
   table.insert(lines, 'done < "$fifo"')

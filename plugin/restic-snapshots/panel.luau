@@ -1863,6 +1863,15 @@ end
 -- cannot word this line": an unknown kind is a kind the panel does not understand, so it is shown
 -- through the line's own `text` when it carries one and skipped when it does not -- never rendered
 -- as "table: 0x...", never given a key nobody translated (en.json has no panel.logs.unknown).
+-- The actions restic reported at 0.19.1. An action that is not listed here is shown as restic
+-- spelled it -- a file this run touched must not vanish behind an untranslated key.
+local FILE_ACTION_KEYS = {
+  new = "panel.logs.file_new",
+  modified = "panel.logs.file_modified",
+  deleted = "panel.logs.file_deleted",
+  unchanged = "panel.logs.file_unchanged",
+}
+
 local function displayLine(line)
   if type(line) ~= "table" then
     if type(line) == "string" and line ~= "" then
@@ -1908,6 +1917,28 @@ local function displayLine(line)
       return text, "error"
     end
     return text, "on_surface/0.7"
+  elseif kind == "file" then
+    -- [0.6.0] The one place in the plugin that names a file. A change is the thing worth looking at,
+    -- so a new or modified path carries the accent; a deletion is informational, not an error.
+    local action = type(line.action) == "string" and line.action or ""
+    local key = FILE_ACTION_KEYS[action]
+    local word = key ~= nil and tr(key) or action
+    if word == "" then
+      word = "?"
+    end
+    local color = "on_surface/0.7"
+    if action == "new" or action == "modified" then
+      color = "primary"
+    elseif action == "deleted" then
+      color = "tertiary"
+    end
+    return tr("panel.logs.file", {
+      action = word,
+      path = type(line.path) == "string" and line.path or "?",
+    }), color
+  elseif kind == "scan" then
+    -- `scan_finished`: what restic looked at, which is the whole story of a run that changed nothing.
+    return tr("panel.logs.scan", { files = logNumber(line.files) }), "on_surface/0.5"
   elseif kind == "records" then
     -- `source` (ls / diff / find / stats) names what was folded, so "40 records" says which kind.
     if type(line.source) == "string" and line.source ~= "" then

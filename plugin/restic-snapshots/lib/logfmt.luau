@@ -418,6 +418,35 @@ local function recordSource(text, messageType)
   return nil
 end
 
+-- ── per-file records: `backup --json --verbose` (0.6.0) ──────────────────────
+
+-- One of these per file AND per directory: `action` is what restic did, `item` is the path
+-- (directories carry a trailing slash), and the rest of the record is sizes and durations this
+-- formatter has no use for.
+--
+-- The job script drops the `unchanged` records before the log is written, so what arrives here is
+-- the short list of what the run actually did -- and this is the only place in the plugin that
+-- learns the name of a file.
+--
+-- `scan_finished` is a verbose_status too and the odd one out: its `item` is EMPTY and
+-- `total_files` is the count restic examined. It gets its own kind so it can never render as a file
+-- line with a blank path.
+local SCAN_ACTION = "scan_finished"
+
+local function verboseStatusLine(object)
+  local action = object.action
+  if type(action) ~= "string" or action == "" then
+    return nil
+  end
+  if action == SCAN_ACTION then
+    return { kind = "scan", files = number(object.total_files) }
+  end
+  -- An action a later restic adds is carried through as restic spelled it: a file this run touched
+  -- must not vanish because the panel had not heard of the verb.
+  local path = object.item
+  return { kind = "file", action = action, path = type(path) == "string" and path or nil }
+end
+
 -- ── the formatter ─────────────────────────────────────────────────────────────
 
 -- Classify one JSON line into the pending list. Returns a tag the caller uses for folding:
@@ -453,6 +482,14 @@ local function classify(text, pending, maxWidth)
   elseif messageType == "summary" then
     table.insert(pending, summaryLine(decoded(), text, maxWidth))
     return "line"
+  elseif messageType == "verbose_status" then
+    local line = verboseStatusLine(decoded())
+    if line ~= nil then
+      table.insert(pending, line)
+      return "line"
+    end
+    -- A verbose_status whose action cannot be read falls through to the text line below rather than
+    -- being dropped: an unanticipated shape stays visible.
   end
 
   local source = recordSource(text, messageType)
