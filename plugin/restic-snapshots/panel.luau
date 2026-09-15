@@ -51,6 +51,11 @@ local ui_state = {
   restoreDraft = nil,    -- { snapshot = <id> } restore confirm, revealed only after a preview
   forgetDraft = nil,     -- { snapshot = <id> } forget-one confirm
   message = nil,
+  -- [0.4.0] The ONE snapshot row whose action sheet / details card is expanded, and the Log tab's
+  -- view mode. Cleared with every other transient step (showTab / onOpen); `logRaw` is a view
+  -- preference rather than a pending action, so a tab switch leaves it alone.
+  openRow = nil,         -- { id = <snapshot id>, sheet = bool, details = bool }
+  logRaw = false,        -- Log tab: false = the typed display lines, true = the service's raw lines
 }
 
 -- ── helpers ──────────────────────────────────────────────────────────────────
@@ -305,9 +310,29 @@ function onContextAction(actionId, context)
   local id = tostring(context or "")
   local row = findRow(id)
 
+  -- An action that changes the view closes the row's action SHEET, whichever surface asked for it:
+  -- the sheet exists only for the row it was opened on, and the native menu can be opened on a row
+  -- whose sheet happens to be open too. The details CARD is deliberately not closed by its own
+  -- buttons -- it is a view the user opened to read, not a menu, and "Copy id" must not take the
+  -- fields away from under them. It closes on its own Close, on a second dots click, when another
+  -- row is expanded, or on a tab switch.
+  if ui_state.openRow ~= nil and ui_state.openRow.id == id and ui_state.openRow.sheet == true then
+    ui_state.openRow = nil
+  end
+
   if actionId == "copy_id" then
     noctalia.copyToClipboard(id)
     ui_state.message = tr("panel.message.copied_id", { id = id })
+    render()
+    return
+  end
+
+  if actionId == "details" then
+    -- The details card, revealed by the sheet on the row it belongs to. Nothing is fetched: the row
+    -- the panel already holds carries every field the card renders (lib/restic.luau snapshotRow).
+    -- Only the sheet offers this entry -- the native menu's item list is frozen at its six actions
+    -- and its test pins them.
+    ui_state.openRow = { id = id, sheet = false, details = true }
     render()
     return
   end
@@ -465,6 +490,198 @@ local function forgetDrawer()
   })
 end
 
+-- ── the per-row action sheet and the details card (0.4.0) ────────────────────
+--
+-- The trailing dots button cannot open the native context menu on a LEFT click: the host refuses
+-- panel.openContextMenu outside a live pointer context (src/scripting/plugin_bindings.cpp returns
+-- false) and the API doc names onRightClick as the only place it may be called. So the left click
+-- opens something the PANEL renders -- a column of small buttons beneath the row (the UI has no
+-- menu or popup node, so it is built from rows of buttons) -- while the right click keeps the native
+-- menu exactly as before (openMenu from onRightClick).
+--
+-- The expansion belongs to one row's id and one row may be expanded at a time: opening row B's
+-- sheet closes row A's. Predictable beats several-at-once here -- the sheet is a menu, not a form,
+-- and a single slot keeps "click the dots again to close" true for whatever happens to be open.
+local SHEET_ENTRIES = {
+  -- The native menu's actions in the same order, plus Details, each naming an EXISTING action id so
+  -- activateSheetEntry can route it through onContextAction -- the very function the native menu's
+  -- onActivate calls. One code path for both surfaces, two-step restore and forget flows included.
+  -- `glyph` values stay string literals: glyph names are checked against the host icon set.
+  { action = "details", label = "panel.action.details", glyph = "info-circle" },
+  { action = "files", label = "panel.action.files", glyph = "file" },
+  { action = "diff_prev", label = "panel.action.diff", glyph = "arrows-diff" },
+  { action = "restore", label = "panel.action.restore", glyph = "arrow-back-up" },
+  { action = "copy_id", label = "panel.action.copy_id", glyph = "copy" },
+  { action = "forget_one", label = "panel.action.forget_one", glyph = "trash" },
+}
+
+local function rowIsOpen(id)
+  local open = ui_state.openRow
+  return open ~= nil and open.id == id
+end
+
+-- Left click on the dots: toggle this row's sheet. A second click on the same dots closes whatever
+-- this row had open (sheet or card); clicking another row's dots moves the expansion there.
+local function toggleSheet(row)
+  local id = tostring(row.id)
+  if rowIsOpen(id) then
+    ui_state.openRow = nil
+  else
+    ui_state.openRow = { id = id, sheet = true, details = false }
+  end
+  render()
+end
+
+-- One router, no extra state: every entry hands its existing action id to onContextAction -- the
+-- very function the native menu's onActivate calls. That function is also what closes this row's
+-- sheet (every entry changes what the panel shows) and re-opens the row as the details card for
+-- `details`, so the two surfaces behave identically by construction.
+local function activateSheetEntry(action, row)
+  onContextAction(action, tostring(row.id))
+end
+
+local function actionSheet(row)
+  local id = tostring(row.id)
+  local children = {}
+  -- Bounded by the frozen entry list above, never by anything the service sent.
+  for _, entry in ipairs(SHEET_ENTRIES) do
+    table.insert(children, ui.button({
+      key = "sheet-" .. entry.action .. "-" .. id,
+      text = tr(entry.label),
+      glyph = entry.glyph,
+      -- The delete entry is not styled destructive: this button only opens the two-step flow, and a
+      -- destructive-looking button would promise something a single click never does.
+      variant = entry.action == "forget_one" and "outline" or "ghost",
+      controlSize = "sm",
+      onClick = function()
+        activateSheetEntry(entry.action, row)
+      end,
+    }))
+  end
+  return ui.column({ key = "sheet-" .. id, gap = 4, padding = 6 }, children)
+end
+
+-- A field the row does not carry renders the catalogue's own "not recorded": never a fabricated
+-- zero, never tostring(nil) ("nil"), never restic.humanBytes(nil) (an em dash is a different
+-- sentence). A real 0 from the row is a value and is shown as one.
+local function detailText(value)
+  if type(value) == "number" then
+    return tostring(value)
+  end
+  if type(value) == "string" and value ~= "" then
+    return value
+  end
+  return tr("panel.details.none")
+end
+
+local function detailBytes(value)
+  if tonumber(value) == nil then
+    return tr("panel.details.none")
+  end
+  return restic.humanBytes(value)
+end
+
+local function detailList(list)
+  if type(list) ~= "table" or #list == 0 then
+    return tr("panel.details.none")
+  end
+  -- Bounded by the entries restic recorded (tags and paths; single digits in practice, and the
+  -- paths are the user's own backup settings), never by bytes walked one at a time.
+  local parts = {}
+  for _, entry in ipairs(list) do
+    table.insert(parts, tostring(entry))
+  end
+  return table.concat(parts, ", ")
+end
+
+-- Short id and full id together: the short one is what the list shows, the full one is what restic
+-- and every IPC payload use. Equal or absent parts are not repeated.
+local function detailId(row)
+  if row.id == nil then
+    return detailText(row.shortId)
+  end
+  local full = tostring(row.id)
+  local short = row.shortId ~= nil and tostring(row.shortId) or nil
+  if short == nil or short == full then
+    return full
+  end
+  return short .. " · " .. full
+end
+
+-- Captured: the absolute time exactly as the row carries it (RFC3339 with the snapshot's own UTC
+-- offset, i.e. local time at capture) AND the relative form this panel already uses elsewhere
+-- (panel.label.ago over restic.ageLabel).
+local function detailCaptured(row)
+  if type(row.time) ~= "string" or row.time == "" then
+    return tr("panel.details.none")
+  end
+  local epoch = restic.epochFromRfc3339(row.time)
+  if epoch == nil then
+    -- An absolute time the panel cannot parse is still the truth about when it was captured; the
+    -- relative half is what gets left out.
+    return row.time
+  end
+  return row.time .. " · " .. tr("panel.label.ago", { age = restic.ageLabel(nowSec() - epoch) })
+end
+
+local function detailRow(key, labelKey, value)
+  return ui.row({ key = key, gap = 8, align = "center" }, {
+    ui.label({ text = tr(labelKey), color = "on_surface/0.6", fontSize = 12 }),
+    ui.spacer({ flexGrow = 1 }),
+    ui.label({ key = key .. "-value", text = tostring(value), fontSize = 12 }),
+  })
+end
+
+local function detailsCard(row)
+  local id = tostring(row.id)
+  return ui.column({ key = "details-" .. id, gap = 4, padding = 10 }, {
+    ui.row({ gap = 8, align = "center" }, {
+      ui.glyph({ name = "info-circle", size = 14, color = "primary" }),
+      ui.label({ key = "details-title", text = tr("panel.details.title"), fontWeight = "bold", fontSize = 12 }),
+      ui.spacer({ flexGrow = 1 }),
+      ui.button({
+        key = "details-files-" .. id,
+        text = tr("panel.action.files"),
+        glyph = "file",
+        variant = "ghost",
+        controlSize = "sm",
+        -- The same code path the menu and the sheet use.
+        onClick = function()
+          onContextAction("files", id)
+        end,
+      }),
+      ui.button({
+        key = "details-copy-" .. id,
+        text = tr("panel.action.copy_id"),
+        glyph = "copy",
+        variant = "ghost",
+        controlSize = "sm",
+        onClick = function()
+          onContextAction("copy_id", id)
+        end,
+      }),
+      ui.button({
+        key = "details-dismiss-" .. id,
+        text = tr("panel.action.close"),
+        variant = "ghost",
+        controlSize = "sm",
+        onClick = function()
+          ui_state.openRow = nil
+          render()
+        end,
+      }),
+    }),
+    detailRow("details-id-" .. id, "panel.details.snapshot_id", detailId(row)),
+    detailRow("details-captured-" .. id, "panel.details.captured", detailCaptured(row)),
+    detailRow("details-host-" .. id, "panel.details.host", detailText(row.hostname)),
+    detailRow("details-tags-" .. id, "panel.details.tags", detailList(row.tags)),
+    detailRow("details-paths-" .. id, "panel.details.paths", detailList(row.paths)),
+    detailRow("details-files-" .. id, "panel.details.files", detailText(row.filesProcessed)),
+    detailRow("details-bytes-" .. id, "panel.details.bytes", detailBytes(row.bytesProcessed)),
+    detailRow("details-added-" .. id, "panel.details.added", detailBytes(row.dataAdded)),
+  })
+end
+
 -- ── snapshots tab ────────────────────────────────────────────────────────────
 
 local function snapshotRow(row)
@@ -497,20 +714,41 @@ local function snapshotRow(row)
         startRestore(row)
       end,
     }),
-    -- The trailing dots button opens the same menu from the left click and the right click.
+    -- The trailing dots button opens the in-panel action sheet from a left click and the native
+    -- context menu from a right click. The left click CANNOT open the native menu: the host refuses
+    -- panel.openContextMenu outside a live pointer context, and the API doc names onRightClick as
+    -- its only legal caller (docs/CONTRACTS-0.4.0.md 1.2). Both surfaces list the same actions.
     ui.button({
       key = "menu-" .. id,
       glyph = "dots-vertical",
       variant = "ghost",
       controlSize = "sm",
       onClick = function()
-        openMenu(row)
+        toggleSheet(row)
       end,
       onRightClick = function()
         openMenu(row)
       end,
     }),
   })
+end
+
+-- The row plus whatever that row has expanded beneath it: the action sheet, or the details card.
+-- Rendered in the same column so the sheet sits under the row it belongs to; the panel has no menu
+-- or popup node to put it anywhere else.
+local function snapshotEntry(row)
+  local id = tostring(row.id)
+  local children = { snapshotRow(row) }
+  local open = ui_state.openRow
+  if open ~= nil and open.id == id then
+    if open.sheet == true then
+      table.insert(children, actionSheet(row))
+    end
+    if open.details == true then
+      table.insert(children, detailsCard(row))
+    end
+  end
+  return ui.column({ key = "entry-" .. id, gap = 6 }, children)
 end
 
 local function filesSection()
@@ -783,7 +1021,7 @@ local function snapshotsTab()
         break
       end
       shown = shown + 1
-      table.insert(items, snapshotRow(row))
+      table.insert(items, snapshotEntry(row))
     end
   end
   for _, node in ipairs(filesSection()) do
@@ -1275,6 +1513,134 @@ local function retentionTab()
 end
 
 -- ── log tab ──────────────────────────────────────────────────────────────────
+--
+-- [0.4.0] The tab used to render the service's raw lines, each with maxLines = 1: every scheduled
+-- backup's log is a single 473-byte `--json` summary record, so the tab showed one clamped fragment
+-- and nothing else (docs/CONTRACTS-0.4.0.md 1.1). It now renders the typed `display` lines the
+-- service publishes (lib/logfmt.luau, frozen in 2.1) with the wording owned HERE -- the formatter
+-- cannot call tr -- and keeps the raw lines behind a toggle for the record itself.
+
+-- The formatter bounds its output; this bound keeps the panel's own work bounded too, because the
+-- tab re-renders on every state publish.
+local MAX_LOG_ROWS = 200
+
+-- "?" is this panel's existing way of saying "the record does not carry this" (see the row meta and
+-- the file listing). A log line is not a details card: a missing count reads as unknown, not as the
+-- catalogue's "not recorded".
+local function logNumber(value, format)
+  local number = tonumber(value)
+  if number == nil then
+    return "?"
+  end
+  if format ~= nil then
+    return string.format(format, number)
+  end
+  return tostring(number)
+end
+
+local function logBytes(value)
+  if tonumber(value) == nil then
+    return "?"
+  end
+  return restic.humanBytes(value)
+end
+
+-- restic's `percent_done` is a 0..1 fraction and this panel's own progress bar uses that scale, so a
+-- fraction is rendered as a percentage. lib/logfmt.luau is another workstream's file and is not in
+-- this worktree yet, so a value already expressed in percent is accepted as-is: of the two possible
+-- readings this picks the one that cannot print 4200% for a job that is 42% done.
+local function logPercent(value)
+  local percent = tonumber(value)
+  if percent == nil then
+    return "?"
+  end
+  if percent <= 1 then
+    percent = percent * 100
+  end
+  return string.format("%.0f", percent)
+end
+
+-- One typed Line -> the sentence the user reads plus the colour it deserves. nil means "this panel
+-- cannot word this line": an unknown kind is a kind the panel does not understand, so it is shown
+-- through the line's own `text` when it carries one and skipped when it does not -- never rendered
+-- as "table: 0x...", never given a key nobody translated (en.json has no panel.logs.unknown).
+local function displayLine(line)
+  if type(line) ~= "table" then
+    if type(line) == "string" and line ~= "" then
+      -- Not the published shape, but it is still something the job said: show it verbatim.
+      return line, "on_surface"
+    end
+    return nil, nil
+  end
+  local kind = line.kind
+  if kind == "text" then
+    if type(line.text) == "string" and line.text ~= "" then
+      return line.text, "on_surface"
+    end
+    return nil, nil
+  elseif kind == "progress" then
+    return tr("panel.logs.progress", {
+      percent = logPercent(line.percent),
+      files = logNumber(line.filesDone) .. "/" .. logNumber(line.totalFiles),
+      bytes = logBytes(line.bytesDone) .. " / " .. logBytes(line.totalBytes),
+    }), "on_surface/0.7"
+  elseif kind == "backup" then
+    return tr("panel.logs.backup", {
+      new = logNumber(line.filesNew),
+      changed = logNumber(line.filesChanged),
+      unchanged = logNumber(line.filesUnmodified),
+      size = logBytes(line.bytesProcessed),
+      added = logBytes(line.dataAdded),
+      seconds = logNumber(line.durationSeconds, "%.1f"),
+    }), "on_surface/0.7"
+  elseif kind == "check" then
+    -- en.json carries one suggestion key (panel.logs.check_repair, "· repair suggested") and none
+    -- for a prune suggestion, so a prune suggestion is reported with the same sentence rather than
+    -- dropped: a suggestion the user never sees is worse than slightly general wording. Reported to
+    -- the lead as a missing key (panel.logs.check_prune).
+    local text = tr("panel.logs.check", { errors = logNumber(line.errors) })
+    if line.suggestRepair == true or line.suggestPrune == true then
+      text = text .. tr("panel.logs.check_repair")
+    end
+    if (tonumber(line.errors) or 0) > 0 then
+      return text, "error"
+    end
+    return text, "on_surface/0.7"
+  elseif kind == "records" then
+    -- `source` (ls / diff / find / stats) has no translation key. The count is what the line is for;
+    -- the records themselves have their own views (Files, Diff).
+    return tr("panel.logs.records", { count = logNumber(line.count) }), "on_surface/0.5"
+  elseif kind == "error" then
+    local message = type(line.message) == "string" and line.message or "?"
+    return tr("panel.logs.error", { message = message }), "error"
+  end
+  if type(line.text) == "string" and line.text ~= "" then
+    return line.text, "on_surface"
+  end
+  return nil, nil
+end
+
+-- The button names the view that IS on screen and switches to the other one, exactly like the sort
+-- toggle above. Formatted is the default: the raw lines are what the tab was complained about.
+-- Both glyph names are Tabler names and stay string literals, so the source-invariants audit checks
+-- them ("undo" and "arrow-up-down" are not in the set and rendered as blanks).
+local function logModeButton()
+  local glyph = "text-wrap"
+  if ui_state.logRaw then
+    glyph = "code"
+  end
+  return ui.button({
+    key = "logs-mode",
+    text = ui_state.logRaw and tr("panel.logs.raw") or tr("panel.logs.formatted"),
+    glyph = glyph,
+    variant = "ghost",
+    controlSize = "sm",
+    onClick = function()
+      ui_state.logRaw = not ui_state.logRaw
+      render()
+    end,
+  })
+end
 
 local function logTab()
   local children = {}
@@ -1294,6 +1660,8 @@ local function logTab()
       ui.label({ key = "joblog-empty", text = tr("panel.empty.logs"), color = "on_surface/0.6", flexGrow = 1 }),
       refresh,
     }))
+    -- en.json carries no key for a hint here ("the log appears after a job runs"), so the empty
+    -- state is left as it was and the missing key is reported to the lead rather than invented.
     return children
   end
 
@@ -1318,23 +1686,65 @@ local function logTab()
       fontSize = 12,
       flexGrow = 1,
     }),
+    logModeButton(),
     refresh,
   }))
 
   local lines = type(joblog.lines) == "table" and joblog.lines or {}
+  local display = type(joblog.display) == "table" and joblog.display or nil
   local items = {}
-  for _, line in ipairs(lines) do
-    table.insert(items, ui.label({ text = tostring(line), fontSize = 11, maxLines = 1 }))
+  local shown = 0
+  local cut = false
+
+  -- Raw is the pre-0.4.0 view: the service's own lines. Formatted renders the typed display lines;
+  -- a log published before the formatter existed carries no `display` at all, so Formatted falls
+  -- back to the lines rather than showing an empty tab.
+  if ui_state.logRaw or display == nil then
+    for _, line in ipairs(lines) do
+      if shown >= MAX_LOG_ROWS then
+        cut = true
+        break
+      end
+      shown = shown + 1
+      -- NO maxLines clamp. One backup summary is a single long JSON record, and clamping it to one
+      -- line is exactly what made this tab unreadable: it has to wrap.
+      table.insert(items, ui.label({ text = tostring(line), fontSize = 11 }))
+    end
+  else
+    for _, line in ipairs(display) do
+      if shown >= MAX_LOG_ROWS then
+        cut = true
+        break
+      end
+      local text, color = displayLine(line)
+      if text ~= nil then
+        shown = shown + 1
+        -- No clamp here either: a hook's output line or a long error has to wrap.
+        table.insert(items, ui.label({ text = tostring(text), color = color, fontSize = 11 }))
+      end
+    end
+    -- The folded count describes the Formatted view only: it says how many progress/record lines
+    -- were folded into the lines above. Raw shows those lines themselves, where the note would
+    -- describe nothing.
+    local folded = tonumber(joblog.collapsed) or 0
+    if folded > 0 then
+      table.insert(items, ui.label({
+        key = "logs-folded",
+        text = tr("panel.logs.folded", { count = tostring(folded) }),
+        color = "on_surface/0.5",
+        fontSize = 11,
+      }))
+    end
   end
   if #items == 0 then
     table.insert(items, ui.label({ text = tr("panel.empty.logs"), color = "on_surface/0.5", fontSize = 12 }))
   end
   table.insert(children, ui.scroll({ key = "joblog", flexGrow = 1, gap = 2, padding = 6, stickToBottom = true }, items))
 
-  if joblog.truncated == true then
+  if joblog.truncated == true or cut then
     table.insert(children, ui.label({
       key = "joblog-truncated",
-      text = tr("panel.logs.truncated", { lines = tostring(#lines) }),
+      text = tr("panel.logs.truncated", { lines = tostring(shown) }),
       color = "on_surface/0.5",
       fontSize = 11,
     }))
@@ -1352,6 +1762,9 @@ local function showTab(id)
     ui_state.forgetDraft = nil
     ui_state.confirmPrune = false
     ui_state.message = nil
+    -- The row expansion belongs to a row on the snapshots tab; leaving the tab closes it. The Log
+    -- tab's Formatted/Raw choice is a view preference, not a pending step, so it stays.
+    ui_state.openRow = nil
   end
   ui_state.tab = id
   if id == "run" then
@@ -1440,6 +1853,7 @@ function onOpen()
   ui_state.restoreDraft = nil
   ui_state.forgetDraft = nil
   ui_state.message = nil
+  ui_state.openRow = nil
   render()
 end
 
