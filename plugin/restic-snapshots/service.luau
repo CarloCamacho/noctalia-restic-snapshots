@@ -55,15 +55,19 @@ local CATCHUP_DELAY_SECONDS = 30
 local SWEEP_INTERVAL_SECONDS = 3600
 
 -- Bounds for the log the panel shows, matching jobs.readLog's own ceiling.
-local LOG_TAIL_BYTES = 32768
-local LOG_TAIL_LINES = 200
+-- [0.4.0] Deliberately modest: every publish copies this payload into shared state and re-renders
+-- the panel inside the same callback, and the host's per-callback interrupt fires for GC events as
+-- well as for CPU time - so a large payload is what killed the publish on a 97 KB listing job (see
+-- docs/CONTRACTS-0.4.0.md section 6). 100 lines is more than a log view ever shows.
+local LOG_TAIL_BYTES = 16384
+local LOG_TAIL_LINES = 100
 -- [0.4.0] The live view while a job is running uses a smaller tail and is refreshed on a timer
 -- rather than on every growth tick. Each refresh republishes state, and the host charges the panel's
 -- re-render to this callback's CPU budget: with a 97 KB listing job the shell reported
 -- "update exceeded its CPU budget" once per run before this. A finished job still publishes the full
 -- tail, and the first refresh of each run is immediate.
-local RUNNING_LOG_TAIL_BYTES = 8192
-local RUNNING_LOG_TAIL_LINES = 60
+local RUNNING_LOG_TAIL_BYTES = 4096
+local RUNNING_LOG_TAIL_LINES = 40
 local RUNNING_LOG_MIN_INTERVAL_SECONDS = 5
 local lastRunningLogAt = nil
 local lastRunningLogToken = nil
@@ -319,11 +323,11 @@ end
 -- The formatter is driven with the same tail text the raw view gets, so the two views can never
 -- describe different runs, and it may never take the panel down: a payload it cannot read is
 -- published as no display at all rather than as an error.
-local function formatLog(text, rawLines)
+local function formatLog(text)
   if type(text) ~= "string" or text == "" then
     return {}, 0
   end
-  local ok, out = pcall(logfmt.format, text, { rawLines = tonumber(rawLines) or LOG_TAIL_LINES })
+  local ok, out = pcall(logfmt.format, text, {})
   if not ok or type(out) ~= "table" then
     noctalia.log("restic: could not format the job log: " .. tostring(out))
     return {}, 0
@@ -931,7 +935,7 @@ end
 local function publishRunningLog(job)
   local lines, truncated, text =
     collectLogLines(job.logPath, RUNNING_LOG_TAIL_BYTES, RUNNING_LOG_TAIL_LINES)
-  local display, collapsed = formatLog(text, RUNNING_LOG_TAIL_LINES)
+  local display, collapsed = formatLog(text)
   noctalia.state.set(state.KEY_JOBLOG, {
     kind = job.kind,
     at = job.startedAt,

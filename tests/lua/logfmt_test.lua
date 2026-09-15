@@ -132,8 +132,9 @@ do
     tostring(line.bytesProcessed))
   check("durationSeconds comes from total_duration", close(line.durationSeconds, 1.167760836),
     tostring(line.durationSeconds))
-  check("the raw view holds the very line restic wrote",
-    #out.raw == 1 and out.raw[1] == text:gsub("\n$", ""), out.raw[1])
+  -- The formatter deliberately builds no second copy of the log (see the module header): the
+  -- caller holds the text, and the panel's Raw view renders the service's own lines.
+  check("the formatter copies nothing back", out.raw == nil, tostring(out.raw))
 end
 
 do
@@ -294,7 +295,7 @@ do
   check("it counts all forty records", line ~= nil and line.count == 40, line and tostring(line.count))
   check("it names the stream restic gave us", line ~= nil and line.source == "ls", line and line.source)
   check("the folded records are counted", out.collapsed == 39, tostring(out.collapsed))
-  check("the raw view still holds every line", #out.raw == 40, tostring(#out.raw))
+  check("the formatter builds no raw copy of a 40-line stream", out.raw == nil, tostring(out.raw))
 end
 
 do
@@ -348,12 +349,9 @@ do
     table.insert(lines, "line " .. index)
   end
   local text = table.concat(lines, "\n")
-  local out = format(text, { rawLines = 3, maxLines = 5 })
-  check("raw is bounded by rawLines", #out.raw == 3, tostring(#out.raw))
-  check("raw keeps the tail", out.raw[3] == "line 500", out.raw[3])
-  local plain = format(text)
-  check("the default rawLines (200) applies", #plain.raw == 200, tostring(#plain.raw))
-  check("the default raw keeps the tail too", plain.raw[200] == "line 500", plain.raw[200])
+  local out = format(text, { maxLines = 5 })
+  check("a 500-line log is bounded to maxLines", #out.display <= 5, tostring(#out.display))
+  check("the lines it cut are reported in collapsed", out.collapsed > 0, tostring(out.collapsed))
 end
 
 do
@@ -366,7 +364,6 @@ do
     { maxWidth = 30 })
   check("an error message is clamped as well", #errorOut.display[1].message == 30,
     tostring(#errorOut.display[1].message))
-  check("clamping does not change the raw view", #out.raw[1] == 400, tostring(#out.raw[1]))
 end
 
 print("== nothing about a log may raise")
@@ -394,12 +391,11 @@ do
   for _, case in ipairs(hostile) do
     local out, err = format(case.value)
     check(case.name .. " does not raise and returns the documented shape",
-      out ~= nil and type(out.display) == "table" and type(out.collapsed) == "number"
-        and type(out.raw) == "table",
+      out ~= nil and type(out.display) == "table" and type(out.collapsed) == "number",
       err)
   end
   check("nil input yields an empty result",
-    #format(nil).display == 0 and #format(nil).raw == 0 and format(nil).collapsed == 0)
+    #format(nil).display == 0 and format(nil).collapsed == 0)
   check("a number input yields an empty result", #format(42).display == 0)
   check("a truncated line is shown, not guessed at",
     kindOf(format('{"message_type":"summary","files_new":1').display[1]) == "text")
@@ -444,7 +440,8 @@ do
   local ok, err = withHostTrap(function()
     for _, name in ipairs(names) do
       local out = logfmt.format(texts[name], {})
-      assert(type(out.display) == "table" and #out.raw > 0, name .. " produced nothing")
+      assert(type(out.display) == "table" and (#out.display > 0 or out.collapsed > 0),
+        name .. " produced nothing")
     end
     logfmt.format('{"message_type":"error","error":{"message":"x"},"code":1}', nil)
     logfmt.format(nil, nil)

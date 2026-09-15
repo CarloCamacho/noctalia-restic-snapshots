@@ -19,9 +19,9 @@
 --     `string.find` (C, one pass per line); a full JSON read happens only for the handful of lines
 --     whose numbers are shown -- the last status line, one summary, a record carrying an error.
 --
--- `M.format(text, opts) -> { display = { Line }, collapsed = number, raw = { string } }`
+-- `M.format(text, opts) -> { display = { Line }, collapsed = number }`
 --
---   opts = { maxLines = 60, maxWidth = 220, rawLines = 200 }   (all optional; <= 0 means no bound)
+--   opts = { maxLines = 60, maxWidth = 220 }   (both optional)
 --
 -- Line kinds -- the panel renders these, this module never words them:
 --
@@ -504,29 +504,28 @@ local function bound(list, limit)
   return out, dropped
 end
 
--- `text` -> { display, collapsed, raw }. Never raises: a log viewer that crashes on a log is worse
+-- `text` -> { display, collapsed }. Never raises: a log viewer that crashes on a log is worse
 -- than no viewer, so every unexpected shape (nil, a number, a partial line, an empty line, a
 -- truncated object) has a defined, quiet result.
 function M.format(text, opts)
-  local result = { display = {}, collapsed = 0, raw = {} }
+  local result = { display = {}, collapsed = 0 }
   if type(text) ~= "string" or text == "" then
     return result
   end
   local options = type(opts) == "table" and opts or {}
   local maxLines = positiveInteger(options.maxLines, DEFAULT_MAX_LINES)
   local maxWidth = positiveInteger(options.maxWidth, DEFAULT_MAX_WIDTH)
-  local rawLines = positiveInteger(options.rawLines, DEFAULT_RAW_LINES)
 
   local pending = {}
-  local raw = {}
-  local rawCount = 0
   local folded = 0
   local recordCount = 0
   local recordIndex = nil
   local progressIndex = nil
 
   -- One pass over the newlines: the work scales with the number of lines, and a line is trimmed
-  -- and probed (never walked byte by byte).
+  -- and probed (never walked byte by byte). No second copy of the log is built here: the caller
+  -- already holds the text and the panel's Raw view renders the caller's own lines, so a duplicate
+  -- would be wasted work - and allocation the host charges to this callback.
   local position = 1
   local length = #text
   while position <= length do
@@ -539,13 +538,6 @@ function M.format(text, opts)
       position = newline + 1
     end
 
-    rawCount = rawCount + 1
-    if rawLines <= 0 then
-      table.insert(raw, rawLine)
-    else
-      -- A ring buffer: only the last `rawLines` lines are kept, and nothing is copied per line.
-      raw[((rawCount - 1) % rawLines) + 1] = rawLine
-    end
 
     local trimmed = trim(rawLine)
     if trimmed == "" then
@@ -575,14 +567,6 @@ function M.format(text, opts)
     end
   end
 
-  if rawLines > 0 and rawCount > rawLines then
-    local ordered = {}
-    for index = rawCount - rawLines + 1, rawCount do
-      table.insert(ordered, raw[((index - 1) % rawLines) + 1])
-    end
-    raw = ordered
-  end
-
   local display = {}
   for _, entry in ipairs(pending) do
     if entry == DROPPED then
@@ -601,7 +585,6 @@ function M.format(text, opts)
   local bounded, cut = bound(display, maxLines)
   result.display = bounded
   result.collapsed = folded + cut
-  result.raw = raw
   return result
 end
 

@@ -93,28 +93,40 @@ Rules (all testable against the fixtures in `tests/fixtures/`):
 * Malformed JSON, an empty line, a partial line, and a nil/!string input must all be handled without
   raising: a log viewer that crashes on a log is worse than no viewer.
 
-### 2.2 `KEY_JOBLOG` (additive; existing fields keep their meaning)
+### 2.2 `KEY_JOBLOG` - metadata plus a path, deliberately small
 
 ```
-{ kind, at, ok, cancelled, exitCode, truncated,       -- unchanged
-  lines = { string },                                  -- unchanged: raw lines (the Raw view)
-  display = { Line },                                  -- NEW: logfmt output
-  collapsed = number }                                 -- NEW: folded progress/record lines
+{ kind, at, ok, cancelled, exitCode, logPath }        -- logPath is NEW
 ```
+
+**The log's text is not published.** An earlier draft put `lines` (and then `display`) in this
+payload; section 6 records why that was a mistake - the publish is a periodic callback, and the
+allocation it caused was what the host killed. The service therefore publishes *where* the log is
+and the panel reads it when the user looks at the Log tab. The panel:
+
+* reads `logPath` with `noctalia.readFile`, bounded to the last 16 KiB (drop a partial first line);
+* formats it with `lib/logfmt.luau` for the Formatted view and splits it for Raw, both inside a
+  `pcall` so a log that cannot be read is a message, never a broken panel;
+* caches by `(path, size, mtime)` so a re-render costs nothing until the log actually changes.
+
+`lines`, `display` and `collapsed` are gone from the payload. The panel owns both views; the service
+owns the job.
 
 ### 2.3 Service behaviour
 
-* Publish `display` and `collapsed` in **both** places that currently set `KEY_JOBLOG`
-  (`finishJob` and `publishJobLog`/`republishJobLog`), and on `initialise()`'s republish.
-* While a job is **running**, refresh `KEY_JOBLOG` (bounded, from the same tail limits) as the poll
-  observes growth, so the Log tab is live. Do not publish on ticks when nothing changed, and never
-  from a tick when no job is active.
+* Publish `KEY_JOBLOG` - metadata and the log's path - in the places that already set it
+  (`finishJob`, `publishJobLog`/`republishJobLog`, and `initialise()`'s republish).
+* While a job is **running**, refresh it as the poll observes growth so the Log tab is live, at most
+  once every few seconds (the first refresh of a run is immediate). A tick that sees no growth
+  publishes nothing, and no tick does any reading or formatting of the log.
+* The service must not read the log body on a tick at all: that is the whole point of this design.
 
 ### 2.4 Panel behaviour
 
-* **Log tab**: render `display` by default with real wrapping (no `maxLines = 1` clamping of JSON);
-  a toggle switches to `lines` (Raw); show `collapsed` with `panel.logs.folded` when non-zero; keep
-  the refresh button and the existing empty state (plus its hint).
+* **Log tab**: read `logPath` itself (see 2.2), then render the formatted lines with real wrapping
+  (no `maxLines = 1` clamping of JSON); a toggle switches to the raw lines; show the folded count
+  when non-zero; keep the refresh button and the existing empty state (plus its hint). A job that
+  has no `logPath` yet, or a log that cannot be read, renders the empty state rather than failing.
 * **Snapshot rows**: the trailing dots button opens an **in-panel action sheet** on left click,
   rendered beneath that row — a column of the existing actions plus `panel.action.details`. The
   native right-click context menu stays exactly as it is (`onRightClick` → `openMenu`). Clicking the
