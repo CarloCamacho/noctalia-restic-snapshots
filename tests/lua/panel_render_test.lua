@@ -733,29 +733,37 @@ nodeByKey("filter-select").props.onChange("0")
 check("back to all snapshots after the hostname checks", rowCount() == 3, tostring(rowCount()))
 
 -- ── log tab ──────────────────────────────────────────────────────────────────
+--
+-- [0.4.0] The service publishes WHERE the log is (logPath) and nothing else, so the tab reads the
+-- file itself. These checks drive the header, the scroll and the refresh button; the Formatted/Raw
+-- rendering over the real fixtures, the malformed-log behaviour, the read bound and the cache each
+-- get their own section at the end of this file.
 
+local FIRST_LOG_PATH = "/tmp/restic-data/jobs/first.jsonl"
+H.files[FIRST_LOG_PATH] = "saved 12 files\nerror: repository is already locked\n"
+H.mtimes[FIRST_LOG_PATH] = 1000
 publish("restic_joblog", {
   kind = "backup", at = 1788874500, ok = false, cancelled = false, exitCode = 1,
-  lines = { "saved 12 files", "error: repository is already locked" },
-  truncated = true,
+  logPath = FIRST_LOG_PATH,
 })
 clickTab("log")
 text = H.text(H.tree)
 check("log header names the job kind", text:find("backup", 1, true) ~= nil, text)
 check("log header shows the verdict", text:find("failed", 1, true) ~= nil, text)
 check("log header shows the exit code", text:find("exit 1", 1, true) ~= nil, text)
-check("log tab renders the tail lines",
-  text:find("saved 12 files", 1, true) ~= nil and text:find("error: repository is already locked", 1, true) ~= nil, text)
+check("log tab renders the log the payload points at",
+  text:find("saved 12 files", 1, true) ~= nil
+    and text:find("error: repository is already locked", 1, true) ~= nil, text)
 check("log lines render inside a scroll",
   H.find(H.tree, function(node) return node.type == "scroll" and node.props.key == "joblog" end) ~= nil)
-check("log tab announces truncation", text:find("log truncated to the last 2 lines", 1, true) ~= nil, text)
+check("a log this small is not announced as truncated", nodeByKey("joblog-truncated") == nil, text)
 nodeByKey("logs-refresh").props.onClick()
 check("log refresh asks for a republish", lastCommand():find("job-log", 1, true) ~= nil, lastCommand())
 
 -- A cancelled job reads as cancelled, not as a failure.
 publish("restic_joblog", {
   kind = "backup", at = 1788874500, ok = false, cancelled = true, exitCode = 130,
-  lines = { "backup cancelled" }, truncated = false,
+  logPath = FIRST_LOG_PATH,
 })
 text = H.text(H.tree)
 check("a cancelled job reads as cancelled", text:find("cancelled", 1, true) ~= nil, text)
@@ -1030,32 +1038,44 @@ clickTab("run")
 clickTab("snapshots")
 check("a tab switch closes the action sheet", nodeByKey("sheet-aaa111") == nil)
 
--- ── [0.4.0] the Log tab: typed display lines, Formatted / Raw ───────────────
--- 0.4.0 fixed the tab that showed one clamped JSON line. The service publishes typed `display` lines
--- (lib/logfmt.luau, frozen in docs/CONTRACTS-0.4.0.md 2.1) and the panel owns the wording; Raw keeps
--- the service's own lines behind the toggle, unclamped.
+-- ── [0.4.0] the Log tab: the panel reads, formats and caches the log itself ────
+-- 0.4.0 fixed the tab that showed one clamped JSON line, and then had to be fixed again: the service
+-- used to format the log and publish its TEXT from its update() tick, and on a 97 KB `ls --json` job
+-- the host killed that callback ("script callback 'update' exceeded its CPU budget"). The service
+-- now publishes { kind, at, ok, cancelled, exitCode, logPath } -- a reference -- and the panel reads
+-- the file itself, formats it with lib/logfmt.luau (frozen in docs/CONTRACTS-0.4.0.md 2.1) and
+-- caches by (path, size, mtime). Every log below is a REAL restic 0.19.1 capture from
+-- tests/fixtures/, placed where the payload points, exactly as the runner leaves it on disk.
 
-local RAW_LINE = "{\"message_type\":\"summary\",\"files_new\":0,\"total_bytes_processed\":860367}"
-local JOB_DISPLAY = {
-  { kind = "text", text = "hook: pre-backup finished" },
-  { kind = "progress", percent = 0.42, filesDone = 12, totalFiles = 34, bytesDone = 1024, totalBytes = 2097152 },
-  { kind = "backup", filesNew = 3, filesChanged = 1, filesUnmodified = 30, dirsNew = 0, dirsChanged = 0,
-    dataAdded = 2048, bytesProcessed = 860367, durationSeconds = 1.2 },
-  { kind = "check", errors = 0, brokenPacks = 0, suggestRepair = false, suggestPrune = false },
-  { kind = "records", count = 40, source = "ls" },
-  { kind = "error", message = "repository is already locked", code = 1 },
-}
+local function fixture(name)
+  local handle = io.open("tests/fixtures/" .. name, "rb")
+  if handle == nil then
+    error("missing fixture tests/fixtures/" .. name)
+  end
+  local text = handle:read("*a")
+  handle:close()
+  return text
+end
+
+-- The file the payload points at, and the payload itself: metadata plus the log's PATH.
+local LOG_PATH = "/tmp/restic-data/jobs/token.jsonl"
 
 local function publishLog(overrides)
   local log = {
-    kind = "backup", at = 1788874500, ok = true, cancelled = false, exitCode = 0,
-    truncated = false, collapsed = 0, display = JOB_DISPLAY, lines = { RAW_LINE },
+    kind = "backup", at = 1788874500, ok = true, cancelled = false, exitCode = 0, logPath = LOG_PATH,
   }
   for key, value in pairs(overrides or {}) do
     log[key] = value
   end
   publish("restic_joblog", log)
   return log
+end
+
+-- Put a fixture where the payload points and re-render, the way a job writing its log does.
+local function showLog(name)
+  H.files[LOG_PATH] = fixture(name)
+  H.mtimes[LOG_PATH] = 1000
+  publishLog({})
 end
 
 -- Any label whose text is exactly this string, so a check can assert the rendered sentence itself.
@@ -1069,53 +1089,65 @@ local function labelWith(value)
   return hit
 end
 
-publishLog({ collapsed = 3 })
 clickTab("log")
-check("a text display line renders verbatim",
-  labelWith("hook: pre-backup finished") ~= nil)
-check("a progress display line renders the percent and the file counts",
-  labelWith("42% · 12/34 files · 1.0 KiB / 2.0 MiB") ~= nil
-    and H.text(H.tree):find("42%", 1, true) ~= nil
-    and H.text(H.tree):find("12/34", 1, true) ~= nil, H.text(H.tree))
-check("a backup display line renders its counts, bytes and duration",
-  labelWith("3 new · 1 changed · 30 unchanged · 840.2 KiB processed · 2.0 KiB added · 1.2s") ~= nil,
+
+-- The real progress fixture: three status lines and the summary, folded as the contract requires.
+showLog("backup-progress.jsonl")
+check("a raw --json progress stream reads as a progress line",
+  labelWith("84% · 3362/4000 files · 210.6 MiB / 250.0 MiB") ~= nil, H.text(H.tree))
+check("the summary that closes the run reads as its own sentence",
+  labelWith("4000 new · 0 changed · 0 unchanged · 250.0 MiB processed · 251.4 MiB added · 1.1s") ~= nil,
   H.text(H.tree))
-check("a check display line renders its error count",
-  labelWith("0 errors") ~= nil)
-check("a records display line names the folded stream",
-  labelWith("40 records (ls)") ~= nil, H.text(H.tree))
-check("an error display line renders its message",
-  labelWith("error: repository is already locked") ~= nil)
-check("a passed check is not coloured as a problem",
-  labelWith("0 errors") ~= nil and labelWith("0 errors").props.color ~= "error")
-check("the folded note appears when lines were folded",
-  nodeText("logs-folded") == "3 lines folded", tostring(nodeText("logs-folded")))
+check("the earlier status lines are counted, not listed",
+  nodeText("logs-folded") == "2 lines folded", tostring(nodeText("logs-folded")))
 check("the Formatted view does not render the raw JSON record",
   H.text(H.tree):find("message_type", 1, true) == nil, H.text(H.tree))
 
--- A check that suggests a repair says so, and reads as a problem.
-publishLog({ display = {
-  { kind = "check", errors = 3, brokenPacks = 2, suggestRepair = true, suggestPrune = false },
-} })
-check("a check line with a suggested repair says so",
-  labelWith("3 errors · repair suggested") ~= nil, H.text(H.tree))
-check("a check line with errors is coloured as a problem",
-  labelWith("3 errors · repair suggested") ~= nil
-    and labelWith("3 errors · repair suggested").props.color == "error")
+-- The user's own complaint (contract 1.1): a scheduled backup's whole log is ONE 473-byte record.
+showLog("backup-summary.jsonl")
+check("the 473-byte one-line log now reads as a sentence",
+  labelWith("0 new · 0 changed · 173 unchanged · 840.2 KiB processed · 0 B added · 1.2s") ~= nil,
+  H.text(H.tree))
+check("a one-line log folds nothing", nodeByKey("logs-folded") == nil)
 
--- The folded note is only for a real fold.
-publishLog({})
-check("no folded note when nothing was folded", nodeByKey("logs-folded") == nil)
+-- A listing job: 40 ls records must never become 40 rows.
+showLog("ls-list.jsonl")
+check("a 40-record ls listing is folded into one counted line",
+  labelWith("40 records (ls)") ~= nil, H.text(H.tree))
+check("the folded records are counted",
+  nodeText("logs-folded") == "39 lines folded", tostring(nodeText("logs-folded")))
+check("no individual ls record reaches the view",
+  H.text(H.tree):find("cachyos-dotfiles", 1, true) == nil, H.text(H.tree))
+
+-- An error line is never folded away, and reads as a problem.
+showLog("error.jsonl")
+local errorLine = labelWith("error: Fatal: unable to open config file: stat /tmp/nope/config: "
+  .. "no such file or directory")
+check("a real restic error line is rendered, not folded", errorLine ~= nil, H.text(H.tree))
+check("an error line is coloured as a problem",
+  errorLine ~= nil and errorLine.props.color == "error")
+
+-- A hook log is plain text: every line is shown verbatim.
+showLog("hooks.txt")
+check("a hook log renders its own lines verbatim",
+  labelWith("== pre-backup command ==") ~= nil and labelWith("pruned 3 old dumps") ~= nil,
+  H.text(H.tree))
+check("a log line wraps instead of being clamped to one line",
+  labelWith("pruned 3 old dumps") ~= nil and labelWith("pruned 3 old dumps").props.maxLines == nil)
 check("the mode button names the view that is on screen",
   nodeText("logs-mode") == "Formatted", tostring(nodeText("logs-mode")))
 
--- Raw: the service's own lines, unclamped, exactly as the tab used to show them (but readable).
+-- ── Raw: the log's own lines, unclamped ─────────────────────────────────────
+-- The pre-0.4.0 view, kept for the record itself: the same file, split into its lines, with no
+-- maxLines clamp -- clamping every line to one is what made a 473-byte summary unreadable.
+
+showLog("backup-summary.jsonl")
 nodeByKey("logs-mode").props.onClick()
 check("the toggle switches to Raw", nodeText("logs-mode") == "Raw", tostring(nodeText("logs-mode")))
-check("Raw renders the service's own lines",
+check("Raw renders the raw --json record itself",
   H.text(H.tree):find("message_type", 1, true) ~= nil, H.text(H.tree))
 check("Raw hides the formatted wording",
-  H.text(H.tree):find("42% · 12/34 files", 1, true) == nil, H.text(H.tree))
+  H.text(H.tree):find("840.2 KiB processed", 1, true) == nil, H.text(H.tree))
 local rawLabel = nil
 for _, node in ipairs(H.findAll(H.tree, H.byType("label"))) do
   if node.props.text ~= nil and tostring(node.props.text):find("message_type", 1, true) ~= nil then
@@ -1132,47 +1164,195 @@ nodeByKey("logs-mode").props.onClick()
 check("the toggle switches back to Formatted", nodeText("logs-mode") == "Formatted",
   tostring(nodeText("logs-mode")))
 check("Formatted renders the translated lines again",
-  labelWith("42% · 12/34 files · 1.0 KiB / 2.0 MiB") ~= nil, H.text(H.tree))
-local hookLabel = labelWith("hook: pre-backup finished")
-check("a formatted text line wraps too", hookLabel ~= nil and hookLabel.props.maxLines == nil)
+  labelWith("0 new · 0 changed · 173 unchanged · 840.2 KiB processed · 0 B added · 1.2s") ~= nil,
+  H.text(H.tree))
+local summaryLabel = labelWith("0 new · 0 changed · 173 unchanged · 840.2 KiB processed · 0 B added · 1.2s")
+check("a formatted line wraps too", summaryLabel ~= nil and summaryLabel.props.maxLines == nil)
 
--- An unknown kind must not crash a log viewer, and must not be given a sentence nobody translated.
-publishLog({ display = {
-  { kind = "text", text = "known line" },
-  { kind = "quantum", text = "an unknown kind" },
-  { kind = "quantum" },
-  42,
-} })
-check("the render survives an unknown display kind", nodeByKey("joblog") ~= nil)
-check("a known line still renders beside it", labelWith("known line") ~= nil, H.text(H.tree))
-check("an unknown kind shows the line's own text and invents nothing",
-  labelWith("an unknown kind") ~= nil
-    and H.text(H.tree):find("quantum", 1, true) == nil
-    and H.text(H.tree):find("panel.logs", 1, true) == nil, H.text(H.tree))
+-- ── a check's own summary ───────────────────────────────────────────────────
+showLog("check-summary.jsonl")
+local checkLine = labelWith("0 errors")
+check("a check summary reads as an error count, not as a backup", checkLine ~= nil, H.text(H.tree))
+check("a passed check is not coloured as a problem",
+  checkLine ~= nil and checkLine.props.color ~= "error")
 
--- A log published before the formatter existed carries no display: Formatted falls back to the raw
--- lines rather than showing an empty tab (the pre-0.4.0 service shape, still exercised above).
-local legacyLog = publishLog({})
-legacyLog.display = nil
-publish("restic_joblog", legacyLog)
-check("Formatted falls back to the lines when no display was published",
-  H.text(H.tree):find("message_type", 1, true) ~= nil, H.text(H.tree))
+-- restic's check summary when it wants attention: the field names are the ones logfmt reads and the
+-- fixtures carry (`suggest_repair_index` / `suggest_prune`), with a non-zero error count.
+H.files[LOG_PATH] = '{"message_type":"summary","num_errors":3,"broken_packs":2,'
+  .. '"suggest_repair_index":true,"suggest_prune":true}\n'
+H.mtimes[LOG_PATH] = 1050
+publishLog({})
+check("a check line with a suggested repair and prune says so",
+  labelWith("3 errors · repair suggested · prune suggested") ~= nil, H.text(H.tree))
+check("a check line with errors is coloured as a problem",
+  labelWith("3 errors · repair suggested · prune suggested") ~= nil
+    and labelWith("3 errors · repair suggested · prune suggested").props.color == "error")
 
--- The panel bounds its own list too, and says so when it cuts: the formatter bounds its output, and
--- this is the panel's own guard against an unbounded re-render (it renders on every publish).
+-- ── a malformed log is a message, never a crash ─────────────────────────────
+-- A log viewer that crashes on a log is worse than no viewer (contract 2.1): half a JSON record, a
+-- bare brace, plain text, a blank line, an unknown message type and an error record whose own JSON
+-- was cut. Everything here is rendered as the line it is, nothing is invented, nothing is folded.
+H.files[LOG_PATH] = '{"message_type":"summary","files_new":3\n'
+  .. '{\n'
+  .. 'not json at all\n'
+  .. '\n'
+  .. '{"message_type":"quantum","what":1}\n'
+  .. '{"message_type":"error"\n'
+  .. '{"message_type":"error","error":{"message":"a real error"},"code":7}\n'
+H.mtimes[LOG_PATH] = 1100
+publishLog({})
+check("the render survives a malformed log", nodeByKey("joblog") ~= nil)
+check("an unreadable JSON line is shown as the line it is",
+  labelWith('{"message_type":"summary","files_new":3') ~= nil
+    and labelWith("not json at all") ~= nil, H.text(H.tree))
+check("an unknown message type is shown verbatim, and invents nothing",
+  labelWith('{"message_type":"quantum","what":1}') ~= nil
+    and H.text(H.tree):find("panel.logs", 1, true) == nil
+    and H.text(H.tree):find("table:", 1, true) == nil, H.text(H.tree))
+check("a real error record inside a malformed log still reads as an error",
+  labelWith("error: a real error") ~= nil, H.text(H.tree))
+
+-- The last line of a live log has no newline yet: still a line, and the numbers the record does not
+-- carry read as unknown rather than as a fabricated zero.
+H.files[LOG_PATH] = '{"message_type":"status","percent_done":0.5,"files_done":1,"total_files":2}'
+H.mtimes[LOG_PATH] = 1200
+publishLog({})
+check("a status line with no trailing newline still renders",
+  labelWith("50% · 1/2 files · ? / ?") ~= nil, H.text(H.tree))
+
+-- One pathological line must not become nine kilobytes of text in the panel.
+H.files[LOG_PATH] = "{" .. string.rep("z", 9000) .. "}\n"
+H.mtimes[LOG_PATH] = 1300
+publishLog({})
+check("an enormous line is clamped, and says so",
+  H.text(H.tree):find("...", 1, true) ~= nil
+    and H.text(H.tree):find(string.rep("z", 300), 1, true) == nil, H.text(H.tree))
+
+-- ── the cache: (path, size, mtime) ──────────────────────────────────────────
+-- The tab re-renders on every state publish -- and the service republishes the log reference as a
+-- live run grows, which is how the view stays live -- so a render that cannot show anything new must
+-- not re-read the file. Same path, same size and same mtime is the whole test.
+
+H.files[LOG_PATH] = fixture("hooks.txt")
+H.mtimes[LOG_PATH] = 1400
+publishLog({})
+local cached = H.text(H.tree)
+check("the fixture renders before the cache check",
+  cached:find("pruned 3 old dumps", 1, true) ~= nil, cached)
+
+-- Same length, same mtime, different bytes: if the panel re-read the file it would show the swap.
+local swapped = (fixture("hooks.txt"):gsub("post%-backup", "post-BACKUP"))
+check("the swap keeps the file's length", #swapped == #H.files[LOG_PATH], tostring(#swapped))
+H.files[LOG_PATH] = swapped
+publishLog({})
+check("a re-render with an unchanged (path, size, mtime) does not re-read the log",
+  H.text(H.tree) == cached, H.text(H.tree))
+
+-- Touching the file the way a job does: the same bytes, a new mtime.
+H.mtimes[LOG_PATH] = 1500
+publishLog({})
+check("a bumped mtime re-reads the log",
+  H.text(H.tree):find("post-BACKUP", 1, true) ~= nil, H.text(H.tree))
+
+-- Another path is another log, whatever the numbers say.
+local OTHER_PATH = "/tmp/restic-data/jobs/other.jsonl"
+H.files[OTHER_PATH] = fixture("error.jsonl")
+H.mtimes[OTHER_PATH] = 1500
+publishLog({ logPath = OTHER_PATH })
+check("a payload pointing at another log reads that one",
+  H.text(H.tree):find("unable to open config file", 1, true) ~= nil, H.text(H.tree))
+
+-- ── the panel's own bounds ──────────────────────────────────────────────────
+-- The panel bounds its own list too, and says so when it cuts: this is its guard against an
+-- unbounded re-render (it renders on every publish). BOTH views keep the LAST rows -- the newest
+-- output is what a log tab is for, and the formatter's own bound drops from the head too.
 local manyLines = {}
 for index = 1, 300 do
   manyLines[index] = "line " .. tostring(index)
 end
-publish("restic_joblog", {
-  kind = "backup", at = 1788874500, ok = true, cancelled = false, exitCode = 0,
-  truncated = false, collapsed = 0, lines = manyLines,
-})
+H.files[LOG_PATH] = table.concat(manyLines, "\n") .. "\n"
+H.mtimes[LOG_PATH] = 1600
+publishLog({})
 check("the panel's own log bound is honest about what it cut",
   nodeText("joblog-truncated") == "log truncated to the last 200 lines",
   tostring(nodeText("joblog-truncated")))
-check("the bound keeps the rows it left out off the tree",
-  H.text(H.tree):find("line 300", 1, true) == nil and H.text(H.tree):find("line 200", 1, true) ~= nil)
+check("the bound keeps the newest rows and drops the oldest",
+  labelWith("line 300") ~= nil and labelWith("line 100") == nil, H.text(H.tree))
+
+-- And the read itself is bounded to the last 16 KiB, with the partial first line dropped exactly as
+-- lib/jobs.luau's readLog does. The file is built so that its final 16384 bytes start 20 bytes into
+-- its first line, and so that the tail is short enough in lines (198) to be inside the view window:
+-- if the fragment were not dropped, "FRAGMENTVALUE" would be the first row on screen.
+local cutLine = string.rep("x", 19) .. "FRAGMENTVALUE"   -- the bound lands 20 bytes into this line
+local secondRow = "SECOND-ROW"
+local lastRow = "FINAL-ROW"
+local middle = string.rep(string.rep("m", 82) .. "\n", 195) .. string.rep("m", 163) .. "\n"
+local rest = secondRow .. "\n" .. middle .. lastRow .. "\n"
+local bigLog = cutLine .. "\n" .. rest
+check("the bounded-log fixture is the size the arithmetic claims",
+  #bigLog == 16403 and #rest == 16370, tostring(#bigLog) .. "/" .. tostring(#rest))
+H.files[LOG_PATH] = bigLog
+H.mtimes[LOG_PATH] = 1700
+publishLog({})
+check("a log bigger than the read bound is read as its last 16 KiB",
+  labelWith(secondRow) ~= nil and labelWith(cutLine) == nil
+    and nodeText("joblog-truncated") ~= nil, H.text(H.tree))
+check("the partial first line the bound cut in half is dropped, not shown",
+  labelWith("FRAGMENTVALUE") == nil, "FRAGMENTVALUE is rendered")
+
+-- ── the empty state: a missing or unreadable log is a message ────────────────
+H.files[LOG_PATH] = nil
+H.mtimes[LOG_PATH] = nil
+publishLog({})
+check("a swept log renders the empty state",
+  nodeText("joblog-empty") == "No job log yet.", tostring(nodeText("joblog-empty")))
+check("the empty state keeps its hint",
+  nodeText("joblog-empty-hint") == "A job's output appears here once it has run.",
+  tostring(nodeText("joblog-empty-hint")))
+check("the run's own header survives the missing log",
+  H.text(H.tree):find("backup", 1, true) ~= nil and H.text(H.tree):find("exit 0", 1, true) ~= nil,
+  H.text(H.tree))
+check("no view toggle is offered for nothing", nodeByKey("logs-mode") == nil)
+check("the empty state still offers a refresh", nodeByKey("logs-refresh") ~= nil)
+
+-- An empty file says the same thing as no file.
+H.files[LOG_PATH] = ""
+H.mtimes[LOG_PATH] = 1800
+publishLog({})
+check("an empty log renders the empty state",
+  nodeText("joblog-empty") == "No job log yet.", tostring(nodeText("joblog-empty")))
+
+-- A read that fails outright must not raise out of a render. The failure is cached with the same
+-- (path, size, mtime) key as any other result -- an unchanged file that could not be read will not
+-- read either on the next render -- so the render that follows a restored read and an unchanged file
+-- still shows the empty state, and only a changed file re-reads.
+H.files[LOG_PATH] = fixture("hooks.txt")
+H.mtimes[LOG_PATH] = 1900
+local realRead = noctalia.readFile
+noctalia.readFile = function() error("simulated unreadable file") end
+publishLog({})
+check("a read that raises renders the empty state instead of breaking the panel",
+  nodeText("joblog-empty") == "No job log yet.", tostring(nodeText("joblog-empty")))
+noctalia.readFile = realRead
+publishLog({})
+check("an unreadable, unchanged log is not re-read either",
+  nodeText("joblog-empty") == "No job log yet.", tostring(nodeText("joblog-empty")))
+H.mtimes[LOG_PATH] = 1950
+publishLog({})
+check("the log renders again once the file changes and the read works",
+  labelWith("pruned 3 old dumps") ~= nil, H.text(H.tree))
+
+-- A payload with no logPath yet (a job that has not written its log) is the same empty state, and a
+-- run in flight still reads as running rather than as a failure with a fabricated exit code.
+publish("restic_joblog", {
+  kind = "backup", at = 1788874500, ok = false, cancelled = false, exitCode = nil,
+})
+check("a payload with no logPath yet renders the empty state, not a broken panel",
+  nodeText("joblog-empty") == "No job log yet.", tostring(nodeText("joblog-empty")))
+check("a run in flight still reads as running",
+  H.text(H.tree):find("running", 1, true) ~= nil, H.text(H.tree))
+check("a run in flight shows no fabricated exit code",
+  H.text(H.tree):find("exit ", 1, true) == nil, H.text(H.tree))
 
 publish("restic_joblog", nil)
 check("the log tab keeps its empty state",

@@ -33,7 +33,6 @@ local schedule = require("./lib/schedule.luau")
 local state = require("./lib/state.luau")
 local store = require("./lib/store.luau")
 local metrics = require("./lib/metrics.luau")
-local logfmt = require("./lib/logfmt.luau")
 
 -- ── constants ────────────────────────────────────────────────────────────────
 
@@ -54,20 +53,16 @@ local CATCHUP_DELAY_SECONDS = 30
 -- runner's own pid-liveness check, so an hourly sweep cannot touch a live one.
 local SWEEP_INTERVAL_SECONDS = 3600
 
--- Bounds for the log the panel shows, matching jobs.readLog's own ceiling.
--- [0.4.0] Deliberately modest: every publish copies this payload into shared state and re-renders
--- the panel inside the same callback, and the host's per-callback interrupt fires for GC events as
--- well as for CPU time - so a large payload is what killed the publish on a 97 KB listing job (see
--- docs/CONTRACTS-0.4.0.md section 6). 100 lines is more than a log view ever shows.
-local LOG_TAIL_BYTES = 16384
-local LOG_TAIL_LINES = 100
--- [0.4.0] The live view while a job is running uses a smaller tail and is refreshed on a timer
--- rather than on every growth tick. Each refresh republishes state, and the host charges the panel's
--- re-render to this callback's CPU budget: with a 97 KB listing job the shell reported
--- "update exceeded its CPU budget" once per run before this. A finished job still publishes the full
--- tail, and the first refresh of each run is immediate.
-local RUNNING_LOG_TAIL_BYTES = 4096
-local RUNNING_LOG_TAIL_LINES = 40
+-- [0.4.0] The live Log tab is refreshed on a timer rather than on every growth tick. Each refresh
+-- republishes the job-log payload inside this callback, and the host charges the panel's re-render -
+-- and any garbage collection the callback's own allocations trigger - to this callback's CPU budget.
+-- A 97 KB `ls --json` job made the text payload the thing that killed the tick: "script callback
+-- 'update' exceeded its CPU budget" measurably scaled with the payload, and bounding it harder
+-- (4 of 4 runs still failed at ~57 KiB) did not fix it. The payload is now a REFERENCE to the log -
+-- its path - so a refresh allocates a six-field table and nothing else; the panel reads, formats and
+-- caches the file itself (docs/CONTRACTS-0.4.0.md 2.2-2.4).
+--
+-- The first refresh of each run is immediate, so a just-started job's log appears at once.
 local RUNNING_LOG_MIN_INTERVAL_SECONDS = 5
 local lastRunningLogAt = nil
 local lastRunningLogToken = nil
@@ -291,64 +286,26 @@ end
 
 -- ── job logs ─────────────────────────────────────────────────────────────────
 
--- The tail of a job log as the panel's viewer wants it: a list of lines, bounded to 200 lines
--- and 32 KiB, plus the text they came from. jobs.readLog does the bounding; the file size is
--- compared against what came back so `truncated` is honest rather than assumed.
-local function collectLogLines(path, maxBytes, maxLines)
-  if type(path) ~= "string" or path == "" then
-    return {}, false, ""
-  end
-  local bytes = tonumber(maxBytes) or LOG_TAIL_BYTES
-  local limit = tonumber(maxLines) or LOG_TAIL_LINES
-  local text = jobs.readLog(path, bytes, limit)
-  local lines = {}
-  for line in text:gmatch("[^\n]+") do
-    table.insert(lines, line)
-  end
-  local truncated = #lines >= limit
-  if not truncated then
-    local info = noctalia.fileInfo(path)
-    local size = info ~= nil and tonumber(info.size) or nil
-    if size ~= nil and size > #text then
-      truncated = true
-    end
-  end
-  return lines, truncated, text
-end
-
--- [0.4.0] restic's `--json` stream is one JSON object per line, so the Log tab used to show a
--- clipped 473-byte blob. `lines` stays exactly what it was (the raw view); `display` is the same
--- text as human lines, formatted by a pure module the panel can render without knowing restic.
+-- The job-log payload: WHERE the log is, plus what the run did. Never the log's text.
 --
--- The formatter is driven with the same tail text the raw view gets, so the two views can never
--- describe different runs, and it may never take the panel down: a payload it cannot read is
--- published as no display at all rather than as an error.
-local function formatLog(text)
-  if type(text) ~= "string" or text == "" then
-    return {}, 0
-  end
-  local ok, out = pcall(logfmt.format, text, {})
-  if not ok or type(out) ~= "table" then
-    noctalia.log("restic: could not format the job log: " .. tostring(out))
-    return {}, 0
-  end
-  local display = type(out.display) == "table" and out.display or {}
-  return display, tonumber(out.collapsed) or 0
-end
-
+-- [0.4.0] This payload used to carry `lines` (the raw tail) and `display`/`collapsed` (the text run
+-- through lib/logfmt.luau), and it was published from the service's `update()` tick while a job was
+-- live -- so a 97 KB `ls --json` job log was formatted, copied into shared state and re-rendered on
+-- every tick, and the host killed the callback with "script callback 'update' exceeded its CPU
+-- budget". The tick now publishes a reference instead: `logPath`. The panel reads the file, formats
+-- it with lib/logfmt.luau and caches the result by (path, size, mtime), so a publish here allocates
+-- one small table and reads nothing (docs/CONTRACTS-0.4.0.md 2.2/2.3).
+--
+-- A path that is missing or empty stays nil rather than becoming "": the panel renders its empty
+-- state for both, and nil says "this payload has no log" instead of "here is a log at nowhere".
 local function publishJobLog(meta, path)
-  local lines, truncated, text = collectLogLines(path)
-  local display, collapsed = formatLog(text)
   noctalia.state.set(state.KEY_JOBLOG, {
     kind = meta ~= nil and meta.kind or nil,
     at = meta ~= nil and meta.at or nil,
     ok = meta ~= nil and meta.ok or false,
     cancelled = meta ~= nil and meta.cancelled == true,
     exitCode = meta ~= nil and meta.exitCode or nil,
-    lines = lines,
-    display = display,
-    collapsed = collapsed,
-    truncated = truncated or (meta ~= nil and meta.truncated == true) or false,
+    logPath = type(path) == "string" and path ~= "" and path or nil,
   })
 end
 
@@ -719,8 +676,14 @@ finishJob = function(job, exitCode, text)
   end
   local ok = code == 0 and not cancelled and not timedOut
 
-  local logText = jobs.readLog(job.logPath)
-  local raw = type(text) == "string" and text ~= "" and text or logText
+  -- [0.4.0] The poll that reached this point already handed us a bounded tail of the log, so reading
+  -- the file again here would be a second read of the same file inside the same tick - the tick the
+  -- host killed on a 97 KB listing job. Only the paths that arrive with no text at all (the watchdog
+  -- finishing a job the runner never reported) read the log, and they read it once.
+  local raw = type(text) == "string" and text or ""
+  if raw == "" then
+    raw = jobs.readLog(job.logPath)
+  end
   local objects = restic.parseJsonLines(raw)
   local summary = restic.lastSummary(objects)
   local request = type(job.request) == "table" and job.request or {}
@@ -734,7 +697,7 @@ finishJob = function(job, exitCode, text)
     -- non-zero code is the hook's, not restic's. The runner writes its own line saying exactly
     -- that, and it is the more specific reason - so it becomes the message instead of "backup
     -- failed", which would blame the wrong process (and is what the generic fallback would say).
-    local jobText = logText ~= "" and logText or raw
+    local jobText = raw
     if jobText:find(PRE_HOOK_ABORT_MARKER, 1, true) ~= nil then
       preHookAborted = true
       errorMessage = PRE_HOOK_ABORT_MARKER
@@ -870,28 +833,17 @@ finishJob = function(job, exitCode, text)
   status.job = nil
   status.jobStartedAt = nil
 
+  -- [0.4.0] The payload is the run's outcome plus WHERE its log is: see publishJobLog. Nothing is
+  -- read and nothing is formatted here - the panel does that when the user looks at the tab.
   local meta = {
     kind = kind,
     at = at,
     ok = ok,
     cancelled = cancelled,
     exitCode = code,
-    truncated = false,
+    logPath = type(job.logPath) == "string" and job.logPath ~= "" and job.logPath or nil,
   }
-  local lines, truncated, logTail = collectLogLines(job.logPath)
-  meta.truncated = truncated
-  local display, collapsed = formatLog(logTail)
-  noctalia.state.set(state.KEY_JOBLOG, {
-    kind = kind,
-    at = at,
-    ok = ok,
-    cancelled = cancelled,
-    exitCode = code,
-    lines = lines,
-    display = display,
-    collapsed = collapsed,
-    truncated = truncated,
-  })
+  publishJobLog(meta, job.logPath)
   lastJobMeta = meta
   if type(job.logPath) == "string" and job.logPath ~= "" then
     lastLogPath = job.logPath
@@ -926,27 +878,24 @@ finishJob = function(job, exitCode, text)
 end
 
 -- [0.4.0] The Log tab is live while a run is in flight. `publishJobLog` only knows about the
--- persisted meta of a *finished* job, so a running one is published here instead, from the same
--- bounded tail (LOG_TAIL_BYTES / LOG_TAIL_LINES) and only when the log has actually grown.
+-- persisted meta of a *finished* job, so a running one is published here instead.
+--
+-- [0.4.0] Nothing is read and nothing is formatted: the payload says WHICH log to read and how far
+-- the run has got, and the panel reads the file itself. Publishing the log's text from here is
+-- exactly what the host killed this tick over on a 97 KB listing job (contracts 2.2/2.3).
 --
 -- `ok` is false because the job has not succeeded yet, not because it failed: the panel already
 -- tells the two apart (a run in flight is the one with `status.job` set). `at` is when the run
--- started, so the header's age is the run's age.
+-- started, so the header's age is the run's age, and `exitCode` stays nil - there is no exit code
+-- yet, and inventing 0 would read as success.
 local function publishRunningLog(job)
-  local lines, truncated, text =
-    collectLogLines(job.logPath, RUNNING_LOG_TAIL_BYTES, RUNNING_LOG_TAIL_LINES)
-  local display, collapsed = formatLog(text)
-  noctalia.state.set(state.KEY_JOBLOG, {
+  publishJobLog({
     kind = job.kind,
     at = job.startedAt,
     ok = false,
     cancelled = job.cancelRequested == true,
     exitCode = nil,
-    lines = lines,
-    display = display,
-    collapsed = collapsed,
-    truncated = truncated,
-  })
+  }, job.logPath)
 end
 
 local function pollJob()
@@ -983,11 +932,12 @@ local function pollJob()
     return
   end
 
-  -- The run is still in flight: refresh the Log tab from the log that just grew. Bounded by the
-  -- same tail limits as the finished path, and skipped entirely when nothing was appended.
+  -- The run is still in flight: republish the log reference so the Log tab knows the log grew and
+  -- re-reads it (it caches by size/mtime, so this signal is what keeps the view live). Nothing is
+  -- read here, and a tick that saw no growth publishes nothing at all.
   if grew then
     -- Throttled, and immediate for the first refresh of each run: every refresh republishes
-    -- KEY_JOBLOG, which re-renders the panel inside this callback (see the bounds above).
+    -- KEY_JOBLOG, which re-renders the panel inside this callback.
     local at = nowSec()
     local firstOfRun = lastRunningLogToken ~= job.token
     if firstOfRun or lastRunningLogAt == nil
