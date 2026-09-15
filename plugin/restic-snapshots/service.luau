@@ -57,6 +57,16 @@ local SWEEP_INTERVAL_SECONDS = 3600
 -- Bounds for the log the panel shows, matching jobs.readLog's own ceiling.
 local LOG_TAIL_BYTES = 32768
 local LOG_TAIL_LINES = 200
+-- [0.4.0] The live view while a job is running uses a smaller tail and is refreshed on a timer
+-- rather than on every growth tick. Each refresh republishes state, and the host charges the panel's
+-- re-render to this callback's CPU budget: with a 97 KB listing job the shell reported
+-- "update exceeded its CPU budget" once per run before this. A finished job still publishes the full
+-- tail, and the first refresh of each run is immediate.
+local RUNNING_LOG_TAIL_BYTES = 8192
+local RUNNING_LOG_TAIL_LINES = 60
+local RUNNING_LOG_MIN_INTERVAL_SECONDS = 5
+local lastRunningLogAt = nil
+local lastRunningLogToken = nil
 
 -- Snapshot rows published for the panel (the widget only needs the count).
 local SNAPSHOT_ROWS_MAX = 200
@@ -280,16 +290,18 @@ end
 -- The tail of a job log as the panel's viewer wants it: a list of lines, bounded to 200 lines
 -- and 32 KiB, plus the text they came from. jobs.readLog does the bounding; the file size is
 -- compared against what came back so `truncated` is honest rather than assumed.
-local function collectLogLines(path)
+local function collectLogLines(path, maxBytes, maxLines)
   if type(path) ~= "string" or path == "" then
     return {}, false, ""
   end
-  local text = jobs.readLog(path, LOG_TAIL_BYTES, LOG_TAIL_LINES)
+  local bytes = tonumber(maxBytes) or LOG_TAIL_BYTES
+  local limit = tonumber(maxLines) or LOG_TAIL_LINES
+  local text = jobs.readLog(path, bytes, limit)
   local lines = {}
   for line in text:gmatch("[^\n]+") do
     table.insert(lines, line)
   end
-  local truncated = #lines >= LOG_TAIL_LINES
+  local truncated = #lines >= limit
   if not truncated then
     local info = noctalia.fileInfo(path)
     local size = info ~= nil and tonumber(info.size) or nil
@@ -307,11 +319,11 @@ end
 -- The formatter is driven with the same tail text the raw view gets, so the two views can never
 -- describe different runs, and it may never take the panel down: a payload it cannot read is
 -- published as no display at all rather than as an error.
-local function formatLog(text)
+local function formatLog(text, rawLines)
   if type(text) ~= "string" or text == "" then
     return {}, 0
   end
-  local ok, out = pcall(logfmt.format, text, { rawLines = LOG_TAIL_LINES })
+  local ok, out = pcall(logfmt.format, text, { rawLines = tonumber(rawLines) or LOG_TAIL_LINES })
   if not ok or type(out) ~= "table" then
     noctalia.log("restic: could not format the job log: " .. tostring(out))
     return {}, 0
@@ -917,8 +929,9 @@ end
 -- tells the two apart (a run in flight is the one with `status.job` set). `at` is when the run
 -- started, so the header's age is the run's age.
 local function publishRunningLog(job)
-  local lines, truncated, text = collectLogLines(job.logPath)
-  local display, collapsed = formatLog(text)
+  local lines, truncated, text =
+    collectLogLines(job.logPath, RUNNING_LOG_TAIL_BYTES, RUNNING_LOG_TAIL_LINES)
+  local display, collapsed = formatLog(text, RUNNING_LOG_TAIL_LINES)
   noctalia.state.set(state.KEY_JOBLOG, {
     kind = job.kind,
     at = job.startedAt,
@@ -969,7 +982,16 @@ local function pollJob()
   -- The run is still in flight: refresh the Log tab from the log that just grew. Bounded by the
   -- same tail limits as the finished path, and skipped entirely when nothing was appended.
   if grew then
-    publishRunningLog(job)
+    -- Throttled, and immediate for the first refresh of each run: every refresh republishes
+    -- KEY_JOBLOG, which re-renders the panel inside this callback (see the bounds above).
+    local at = nowSec()
+    local firstOfRun = lastRunningLogToken ~= job.token
+    if firstOfRun or lastRunningLogAt == nil
+        or at - lastRunningLogAt >= RUNNING_LOG_MIN_INTERVAL_SECONDS then
+      lastRunningLogToken = job.token
+      lastRunningLogAt = at
+      publishRunningLog(job)
+    end
   end
 
   -- Watchdog. Without it one hung restic blocked every future run forever (review finding #4).

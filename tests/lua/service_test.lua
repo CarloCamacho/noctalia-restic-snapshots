@@ -1411,11 +1411,22 @@ do
     first.kind == "backup" and first.ok == false and first.exitCode == nil,
     tostring(first.ok) .. "/" .. tostring(first.exitCode))
 
+  -- The live refresh is throttled: every republish re-renders the panel inside this service
+  -- callback, and on a 97 KB listing job that tripped the host's per-callback CPU budget, so a
+  -- growth poll inside the window must publish nothing at all.
   H.files[paths.log] = "== post-backup command ==\npruned 3 old dumps\n"
+  update()
+  check("a growth poll inside the live-refresh window publishes nothing",
+    H.published["restic_joblog"] == first)
+
+  -- Past the window, and only for bytes appended after it, the display follows the log (the bytes
+  -- above were already accounted for by the skipped poll, so they are not "new" any more).
+  H.nowMs = (NOW_SEC + 6) * 1000
+  H.files[paths.log] = "== post-backup command ==\npruned 3 old dumps\nstill going\n"
   update()
   local second = H.published["restic_joblog"]
   check("the display follows a growing log across polls",
-    second ~= first and #second.display == 2 and second.display[2].text == "pruned 3 old dumps",
+    second ~= first and #second.display == 3 and second.display[2].text == "pruned 3 old dumps",
     second and tostring(#(second.display or {})))
 
   -- A tick that sees no new bytes must not publish: the panel re-renders on every state change.
