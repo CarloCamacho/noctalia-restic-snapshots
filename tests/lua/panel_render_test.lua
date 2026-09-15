@@ -702,6 +702,78 @@ check("diff reads paths published under the count names",
 check("diff counts a list published under a count name",
   nodeText("diff-counts") == "1 added · 0 removed · 0 changed", tostring(nodeText("diff-counts")))
 
+-- ── nothing in a row may run past the panel's right edge ─────────────────────
+-- Reported from a real panel: the diff header put two FULL 64-character snapshot ids in one
+-- unclamped label, so the line ran to the panel's right edge and past it.
+--
+-- The header was not the only one. `maxLines = 1` stops a SECOND line; it never stops a first line
+-- that is too wide. A path, a hash or a comma-joined tag list has no break opportunity, so it is
+-- rendered at its natural width, and the `ui.spacer` sitting beside it collapses to nothing and
+-- takes whatever is to its right off the edge with it.
+--
+-- The harness has no layout engine, so what is asserted here is the BOUND -- the constraint whose
+-- absence caused the overflow. A label that shares a row must either fill the leftover width
+-- (flexGrow) or cap itself (maxWidth). Nothing below checks that it looks right; only that the
+-- thing preventing the overflow is there.
+
+local function bounded(label)
+  return label ~= nil and (label.props.flexGrow ~= nil or label.props.maxWidth ~= nil)
+end
+
+local function labelSaying(value)
+  for _, node in ipairs(H.findAll(H.tree, H.byType("label"))) do
+    if node.props.text == value then
+      return node
+    end
+  end
+  return nil
+end
+
+local LONG_FROM = "c9ff02c09ab698c7ecca1f7b2e7f007b107e2b08fac6c88e00e615e52017d393"
+local LONG_TO = "06b077d2a798a21a77d0dd659bfb5992aa79094d4aec8f0e0e5ec1d4bb0e4b1a"
+local LONG_PATH = "/home/ian/cachyos-dotfiles/home/.config/niri/config.kdl"
+
+publish("restic_diff", {
+  from = LONG_FROM, to = LONG_TO, added = 1, removed = 0, changed = 0,
+  truncated = false, at = 1788874602, ok = true,
+  addedPaths = { LONG_PATH }, removedPaths = {}, changedPaths = {},
+})
+
+local diffTitle = nodeByKey("diff-title")
+check("the diff header renders", diffTitle ~= nil)
+check("the diff header shows the short ids, not two 64-character ones",
+  diffTitle ~= nil and diffTitle.props.text:find(LONG_FROM, 1, true) == nil
+    and diffTitle.props.text:find("c9ff02c0", 1, true) ~= nil
+    and diffTitle.props.text:find("06b077d2", 1, true) ~= nil,
+  diffTitle and diffTitle.props.text)
+check("the diff header is bounded, so no payload can widen it again",
+  bounded(diffTitle), diffTitle and tostring(diffTitle.props.flexGrow))
+
+pathRows = H.findAll(H.tree, H.byKey("diff-path-"))
+check("a diff path is bounded to the width it has",
+  pathRows[1] ~= nil and bounded(pathRows[1].children[2]),
+  pathRows[1] and tostring(pathRows[1].children[2] and pathRows[1].children[2].props.flexGrow))
+
+-- The file listing has the same shape and the same risk: an absolute path, then a size.
+H.stateValues["restic_files"] = {
+  snapshot = "aaa111", truncated = false, at = 1788874602, ok = true,
+  entries = { { path = LONG_PATH, size = 4200 } },
+}
+publish("restic_files", H.stateValues["restic_files"])
+check("a file listing path is bounded to the width it has",
+  bounded(labelSaying(LONG_PATH)), tostring(labelSaying(LONG_PATH) ~= nil))
+
+-- And a snapshot row's tags: user-authored, so as long as the user cares to make them.
+check("a row's tags are bounded to the width they have",
+  bounded(labelSaying(" · noctalia")), tostring(labelSaying(" · noctalia") ~= nil))
+
+-- Put the tree back as this section found it. The checks that follow read the tree as it stands.
+publish("restic_files", nil)
+publish("restic_diff", {
+  from = "bbb222", to = "aaa111", truncated = false, at = 1788874602, ok = true,
+  added = { "/tmp/data/under-count.txt" }, removed = {}, changed = {},
+})
+
 -- ── "this host only" reads /etc/hostname (0.3.0) ─────────────────────────────
 -- The old filter inferred the host from the newest tagged snapshot. restic records the host of the
 -- machine that MADE a snapshot, and one repository can hold snapshots from several machines, so the
@@ -723,8 +795,12 @@ H.files["/etc/hostname"] = "nas\n"
 render()
 check("this host only trims and matches the file exactly",
   rowCount() == 1, tostring(rowCount()))
+-- Asserted on the row's own key, never on text that merely contains the id: a diff header naming the
+-- same snapshot satisfies a text search while the wrong row is on screen, which is exactly what
+-- happened when the diff section was cleared elsewhere and this check went red for the wrong reason.
 check("this host only keeps the row the file names",
-  H.text(H.tree):find("bbb222", 1, true) ~= nil, H.text(H.tree))
+  rowCount() == 1 and H.find(H.tree, H.byKey("row-bbb222")) ~= nil,
+  tostring(rowCount()) .. " row(s)")
 H.files["/etc/hostname"] = "/etc/hostname's own host\n" -- never a hostname a snapshot carries
 render()
 check("a rowless hostname is not silently ignored", rowCount() == 0, tostring(rowCount()))

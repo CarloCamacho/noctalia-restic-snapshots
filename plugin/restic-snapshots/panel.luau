@@ -734,7 +734,15 @@ local function snapshotRow(row)
   end
   table.insert(headline, ui.spacer({ flexGrow = 1 }))
   if tags ~= "" then
-    table.insert(headline, ui.label({ text = tags, color = "on_surface/0.5", fontSize = 11, maxLines = 1 }))
+    table.insert(headline, ui.label({
+      text = tags,
+      color = "on_surface/0.5",
+      fontSize = 11,
+      maxLines = 1,
+      -- A tag list is user-authored, so it can be as long as the user cares to make it: the spacer
+      -- before it keeps it right-aligned, and this caps it rather than letting it widen the row.
+      maxWidth = 240,
+    }))
   end
 
   return ui.row({ key = "row-" .. id, gap = 8, align = "center", padding = 6 }, {
@@ -840,8 +848,10 @@ local function filesSection()
         text = tostring(entry.path or entry.name or "?"),
         fontSize = 11,
         maxLines = 1,
+        -- Fills the row so the size stays right-aligned and a long path clamps at the edge. The
+        -- spacer this replaces collapsed to nothing whenever the path was wider than the row.
+        flexGrow = 1,
       }),
-      ui.spacer({ flexGrow = 1 }),
       ui.label({ text = restic.humanBytes(entry.size), color = "on_surface/0.6", fontSize = 11 }),
     }))
   end
@@ -903,11 +913,25 @@ local function diffPathRows(out, groups)
       shown = shown + 1
       table.insert(out, ui.row({ key = "diff-path-" .. tostring(shown), gap = 8, align = "center" }, {
         ui.label({ text = group.marker, color = group.color, fontSize = 11 }),
-        ui.label({ text = path, fontSize = 11, maxLines = 1 }),
+        -- Same trap: an absolute path has no break opportunity, so it renders at its natural width
+        -- and pushes past the row. flexGrow makes it fill and clamp instead.
+        ui.label({ text = path, fontSize = 11, maxLines = 1, flexGrow = 1 }),
       }))
     end
   end
   return shown
+end
+
+-- [0.6.3] A snapshot id is 64 characters, and two of them in one unclamped label ran the diff header
+-- off the panel's right edge. restic's own tooling quotes the first eight, every row in this panel
+-- already shows `shortId`, and the whole id is still on the snapshot's details card -- so the header
+-- quotes the short form.
+local function shortRef(value)
+  local text = tostring(value or "?")
+  if #text > 8 then
+    return text:sub(1, 8)
+  end
+  return text
 end
 
 local function diffSection()
@@ -923,11 +947,16 @@ local function diffSection()
     ui.row({ gap = 8, align = "center" }, {
       ui.label({
         key = "diff-title",
-        text = tr("panel.diff.header", { from = tostring(diff.from or "?"), to = tostring(diff.to or "?") }),
+        text = tr("panel.diff.header", { from = shortRef(diff.from), to = shortRef(diff.to) }),
         fontWeight = "bold",
         fontSize = 12,
+        -- Fills the row and clamps at its edge. A label takes its NATURAL width otherwise, and
+        -- `maxLines = 1` stops a second line without ever stopping a first one that is too wide --
+        -- which is how this header ran off the panel. The spacer this replaces only competed with
+        -- the label for the leftover width, so it is gone.
+        flexGrow = 1,
+        maxLines = 1,
       }),
-      ui.spacer({ flexGrow = 1 }),
       dismissButton("diff-dismiss", function()
         diff = nil
         render()
