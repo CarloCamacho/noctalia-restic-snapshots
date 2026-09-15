@@ -197,6 +197,29 @@ The tab opens with the repository's shape rather than a wall of rows:
 The Run tab fills a bar across the interval to the next backup, and the bar widget carries the same
 history as a sparkline beside its glyph.
 
+### Reading the Log tab
+
+The Log tab shows the **last job's own log**, read from disk when you open the tab. Backups run restic
+with `--verbose`, so the log records what the run did to each file — and the job script discards the
+`unchanged` records as it writes, which is what keeps a quiet hour short:
+
+```
+scanned 173 files
+0 new · 0 changed · 173 unchanged · 840.2 KiB processed · 0 B added · 1.2s
+```
+
+A run that changed something names the files it changed, which is the only place in the plugin that
+does:
+
+```
+scanned 2 files
+modified · /home/ian/cachyos-dotfiles/.config/niri/config.kdl
+0 new · 1 changed · 1 unchanged · 1.8 KiB added · 0.8s
+```
+
+*Formatted* is the default view; *Raw* shows restic's own JSON lines untouched. The tab reads at most
+the last 16 KB and renders at most 200 rows, and says so when it has done either.
+
 ### Where the panel opens
 
 The panel is a normal plugin panel, so the shell places it: **Settings → Plugins → Restic Snapshots
@@ -674,6 +697,7 @@ at the time, for a reason worth recording:
 | --- | --- | --- |
 | The retention preview reported *keep 0, remove 0* for a repository whose own `forget --dry-run` output says `keep: 2, remove: null` | the plugin returned a **confident zero** from a payload it could not parse: the service reads logs with `parseJsonLines` (one decoded value per *line*), the test used `parseObject` (one decode of the whole text), and restic writes the entire forget array on **one line** — so production passed `{ array }` and the group test was satisfied by the wrapper | the array is unwrapped at the boundary; an unreadable non-empty payload returns `nil` so the panel reports a failure rather than a zero. `restic_pure_test` now asserts the **wrapped** shape, which is the shape the service actually passes |
 | `entry 'browser' setting 'browser_placement' shadows a plugin-level setting; entry value wins` on **every** manifest load | the host only suppresses its injected copies when the *entry* declares the key (`hasSettingKey` inspects `entry.settings`), so a plugin-level declaration was ignored and the entry's value shadowed it | both keys are declared as `[[panel.setting]]` on the `browser` entry. Proved side by side: `noctalia plugins lint` on 0.4.0 prints the two warnings, on 0.5.0 prints none |
+| The Log tab showed one line and always would: every job log on the machine held exactly one record | a `message_type` histogram of every log file: four hourly backups at 1 × `summary` (473 bytes, identical each hour), one `ls` job at 260 × `node`. `backup --json` writes a single summary when nothing is copied, and the job script diverts every `status` line to `.status`, so nothing else reached the log | backup jobs now run with `--verbose`; the job script discards the `unchanged` records. The real repository goes from 262 raw lines / 61 KB to **2 lines / 682 bytes**, and a run that changes a file names it |
 
 The whole suite, run from the repository root:
 
@@ -684,11 +708,11 @@ luac -p plugin/restic-snapshots/*.luau plugin/restic-snapshots/lib/*.luau   # sy
 noctalia plugins lint plugin/restic-snapshots   # manifest + entries
 ```
 
-All four are green on `release/0.5.0`: `luac -p` parses all thirteen `.luau` files, the Python suite
-runs 100 tests (one skipped), the eleven Lua suites pass — including the 0.5.0 additions to
-`restic_pure_test` (the `parseJsonLines` wrapper shape that the retention defect hid behind),
-`panel_render_test` and `widget_render_test` — and `noctalia plugins lint` reports
-`0 errors, 0 warnings`.
+All four are green on `release/0.6.0`: `luac -p` parses all thirteen `.luau` files, the Python suite
+runs 105 tests (one skipped), the eleven Lua suites pass — including the additions for 0.5.0 (the
+`parseJsonLines` wrapper shape the retention defect hid behind) and 0.6.0 (the `--verbose` record
+shape, the job script's `unchanged` filter, and the per-file log lines) — and
+`noctalia plugins lint` reports `0 errors, 0 warnings`.
 
 ## Notes
 

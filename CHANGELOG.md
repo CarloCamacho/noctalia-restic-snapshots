@@ -1,5 +1,52 @@
 # Changelog
 
+## 0.6.0 — 2026-09-15
+
+The Log tab release. 0.5.0 gave the Snapshots tab something to say; the Log tab still said one line —
+the same line every hour — because that was genuinely all restic wrote to it. This release makes the
+job log a record of what the run did.
+
+### Added
+
+- **The log now names the files a run changed.** Backup jobs run restic with `--verbose`, which emits
+  one record per file *and* per directory with the action taken. The job script drops the `unchanged`
+  ones as it writes the log, so a quiet run stays short and a run that changed something names what it
+  changed. Measured on the real repository: the raw `--verbose` stream is **262 lines / 61 KB**, and
+  the filtered log the panel reads is **2 lines / 682 bytes** —
+  `scanned 173 files` and `0 new · 0 changed · 173 unchanged · 0 B added`.
+- **`scan_finished` reads as what restic examined** rather than as a file with a blank path. It is a
+  `verbose_status` with an empty `item` and a `total_files` count, so it gets its own line kind.
+
+### Fixed
+
+- **The Log tab showed one line, and always would have.** Not a parse failure and not a rendering one:
+  `backup --json` writes a single `summary` object for a run that copies nothing — the job log on disk
+  was **473 bytes, one line, byte-identical every hour** — and the job script routes every `status`
+  line to the `.status` file instead of the log, so nothing else ever survived to be displayed. The
+  tab was working correctly against a log that had nothing in it. `--verbose` is what puts something
+  there.
+
+### Changed
+
+- `restic.backupArgs` gains `--verbose`. Only `backup` asks for it: it is the only command with
+  per-file actions worth recording, and the blast radius of changing a backup invocation is kept to
+  the one command that needs it.
+- The generated job script gains a `case` arm that discards the `unchanged` verbose records. The
+  filter lives in the job script rather than in the panel, so a quiet run's log is small on disk and
+  the panel never reads or formats records it cannot use.
+- An action restic adds later is shown as restic spelled it rather than dropped, and a per-file line
+  is never folded into a count: a file a run touched must not vanish because the panel had not heard
+  of the verb.
+
+### Notes
+
+- **Cost, measured.** The log grows only with what actually changed. A first backup of a new tree
+  writes one line per file; an unchanged hourly run writes two. The panel already bounds its read to
+  the last 16 KB / 200 rows, and the jobs directory is swept after a day, so neither the read nor the
+  render is proportional to a large log — the failure mode 0.4.0 fixed.
+- **`--verbose` does not disturb the live progress path.** The `.status` routing is unchanged and
+  restic's message types are independent; the Run tab's progress still reads the last `status` line.
+
 ## 0.5.0 — 2026-09-15
 
 The glanceability release. 0.4.0 made the plugin readable; the panel was still a table of
