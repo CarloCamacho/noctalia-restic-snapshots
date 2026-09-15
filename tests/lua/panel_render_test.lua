@@ -1360,5 +1360,109 @@ check("the log tab keeps its empty state",
 check("the empty state still offers a refresh", nodeByKey("logs-refresh") ~= nil)
 check("no mode toggle before a log exists", nodeByKey("logs-mode") == nil)
 
+-- ── the history strip, the hero and the countdown (0.5.0) ─────────────────────
+-- The strip is the repository's shape: one bar per snapshot, as tall as the bytes that snapshot
+-- actually added. These checks pin the two things that make it worth having -- a bar per snapshot,
+-- and the raised bar on the snapshot that changed -- because a strip whose bars do not track
+-- dataAdded is decoration, not information.
+
+H.config.keep_last = 7
+H.config.keep_daily = 7
+H.config.keep_weekly = 4
+H.config.keep_monthly = 6
+publishRows(function(rows)
+  rows[1].dataAdded = 8192 -- newest, and the only one that changed
+  rows[2].dataAdded = 0
+  rows[3].dataAdded = 0
+end)
+clickTab("snapshots")
+
+local strip = nodeByKey("history-strip")
+check("the history strip renders once there is history", strip ~= nil)
+local bars = strip ~= nil and H.findAll(strip, H.byType("box")) or {}
+check("the strip has one bar per snapshot", #bars == 3, tostring(#bars))
+-- The strip runs oldest to newest, so aaa111 -- the newest row, the one that added data -- is last.
+check("only the snapshot that added data gets a raised bar",
+  bars[1] ~= nil and bars[3] ~= nil and bars[3].props.height > bars[1].props.height,
+  tostring(bars[1] and bars[1].props.height) .. " vs " .. tostring(bars[3] and bars[3].props.height))
+check("the raised bar carries the accent role",
+  bars[3] ~= nil and bars[3].props.fill == "primary", tostring(bars[3] and bars[3].props.fill))
+check("a snapshot that added nothing gets a dim bar instead",
+  bars[1] ~= nil and bars[1].props.fill ~= "primary", tostring(bars[1] and bars[1].props.fill))
+check("the hero reports what was stored and what was walked, not one number for both",
+  tostring(nodeText("history-stored")):find("8.0 KiB", 1, true) ~= nil
+    and tostring(nodeText("history-stored")):find("7.0 KiB", 1, true) ~= nil,
+  tostring(nodeText("history-stored")))
+check("the hero says a repository that stopped growing is the good outcome",
+  tostring(nodeText("history-note")):find("good outcome", 1, true) ~= nil,
+  tostring(nodeText("history-note")))
+check("a row calls out the bytes it added", H.text(H.tree):find("+8.0 KiB", 1, true) ~= nil, H.text(H.tree))
+
+-- The headline is recency now, so the absolute date has to survive somewhere or the panel has lost
+-- the one fact you need when you are hunting for "the snapshot from Tuesday".
+local rowText = tostring(H.text(nodeByKey("row-aaa111")))
+check("the row headline leads with recency beside the clock time",
+  rowText:find("ago", 1, true) ~= nil and rowText:find("22:15:06", 1, true) ~= nil, rowText)
+check("the absolute date survives as a day heading",
+  nodeByKey("day-2026-09-08") ~= nil and nodeText("day-2026-09-08") == "2026-09-08",
+  tostring(nodeText("day-2026-09-08")))
+check("the day heading appears once for the day, not once per row",
+  #H.findAll(H.tree, H.byKey("day-")) == 1, tostring(#H.findAll(H.tree, H.byKey("day-"))))
+
+-- The vocabulary's own signals for an active tab and for dismiss.
+check("the active tab uses selected rather than repainting itself primary",
+  nodeByKey("tab-snapshots") ~= nil and nodeByKey("tab-snapshots").props.selected == true
+    and nodeByKey("tab-snapshots").props.variant == "ghost",
+  tostring(nodeByKey("tab-snapshots") and nodeByKey("tab-snapshots").props.variant))
+check("close is the x glyph rather than the word Close",
+  nodeByKey("close") ~= nil and nodeByKey("close").props.glyph == "x",
+  tostring(nodeByKey("close") and nodeByKey("close").props.glyph))
+
+-- The action sheet is contained: a bare column stretches its children and a button centres its
+-- content, which is how the sheet came to render as a full-width stack of centred buttons.
+nodeByKey("menu-aaa111").props.onClick()
+check("the action sheet is a bounded surface, not a stretched stack",
+  nodeByKey("sheet-aaa111") ~= nil and nodeByKey("sheet-aaa111").props.width == 250
+    and nodeByKey("sheet-aaa111").props.fill ~= nil,
+  tostring(nodeByKey("sheet-aaa111") and nodeByKey("sheet-aaa111").props.width))
+check("the sheet's entries left-align their labels",
+  nodeByKey("sheet-details-aaa111") ~= nil
+    and nodeByKey("sheet-details-aaa111").props.contentAlign == "start",
+  tostring(nodeByKey("sheet-details-aaa111") and nodeByKey("sheet-details-aaa111").props.contentAlign))
+clickTab("snapshots")
+
+-- ── the countdown (0.5.0) ─────────────────────────────────────────────────────
+
+clickTab("run")
+local countdown = nodeByKey("countdown")
+check("the run tab fills the interval to the next backup",
+  countdown ~= nil and tonumber(countdown.props.progress) ~= nil,
+  tostring(countdown and countdown.props.progress))
+check("the countdown reads as part of the way there, not as empty or full",
+  countdown ~= nil and countdown.props.progress > 0 and countdown.props.progress < 1,
+  tostring(countdown and countdown.props.progress))
+
+H.stateValues["restic_status"].phase = "running"
+H.stateValues["restic_status"].busy = true
+render()
+check("a running job replaces the countdown rather than sharing the row with it",
+  nodeByKey("countdown") == nil)
+H.stateValues["restic_status"].phase = "idle"
+H.stateValues["restic_status"].busy = false
+render()
+
+-- ── the prune note only when a confirmation can follow it ─────────────────────
+
+clickTab("retention")
+publish("restic_job", {
+  kind = "forget-dry", at = 1788874602, ok = true,
+  keepCount = 22, removeCount = 0, remove = {}, truncated = false,
+})
+check("a preview that removes nothing still reports its counts",
+  H.text(H.tree):find("Would keep 22, remove 0", 1, true) ~= nil, H.text(H.tree))
+check("no note pointing at a confirmation that cannot appear",
+  nodeByKey("preview-note") == nil)
+check("no prune button when there is nothing to remove", nodeByKey("prune") == nil)
+
 print(string.format("\n%s -- %d failure(s)", failures == 0 and "ALL PASS" or "FAILURES", failures))
 os.exit(failures == 0 and 0 or 1)

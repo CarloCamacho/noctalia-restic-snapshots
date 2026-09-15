@@ -554,12 +554,28 @@ local function actionSheet(row)
       -- destructive-looking button would promise something a single click never does.
       variant = entry.action == "forget_one" and "outline" or "ghost",
       controlSize = "sm",
+      -- Left-aligned content: without it the labels sit centred in the full-width row.
+      contentAlign = "start",
       onClick = function()
         activateSheetEntry(entry.action, row)
       end,
     }))
   end
-  return ui.column({ key = "sheet-" .. id, gap = 4, padding = 6 }, children)
+  -- Contained and right-aligned. A bare column stretches its children across the width and a
+  -- button centres its content by default, so an uncontained sheet renders as a full-width
+  -- stack of centred buttons: a drawer that looks broken rather than a menu on its row.
+  return ui.row({ justify = "end", padding = 4 }, {
+    ui.column({
+      key = "sheet-" .. id,
+      width = 250,
+      gap = 2,
+      padding = 6,
+      fill = "surface_variant/0.5",
+      radius = 8,
+      border = "outline/0.4",
+      borderWidth = 1,
+    }, children),
+  })
 end
 
 -- A field the row does not carry renders the catalogue's own "not recorded": never a fabricated
@@ -691,9 +707,39 @@ local function snapshotRow(row)
   if type(row.tags) == "table" and #row.tags > 0 then
     tags = " · " .. table.concat(row.tags, ", ")
   end
+  -- The headline is what a person scans for, and a 35-character nanosecond ISO string is not it.
+  -- Recency leads, the clock time sits beside it, and the bytes this snapshot added are called out
+  -- when there are any -- which is the one thing that differs between twenty-two hourly rows.
+  local headline = {}
+  local epoch = restic.epochFromRfc3339(row.time)
+  if epoch ~= nil then
+    table.insert(headline, ui.label({
+      text = tr("panel.label.ago", { age = restic.ageLabel(nowSec() - epoch) }),
+      fontSize = 12,
+      fontWeight = "bold",
+    }))
+  else
+    table.insert(headline, ui.label({ text = tr("panel.label.unknown_time"), fontSize = 12, fontWeight = "bold" }))
+  end
+  if type(row.time) == "string" and #row.time >= 19 then
+    table.insert(headline, ui.label({ text = row.time:sub(12, 19), color = "on_surface/0.5", fontSize = 11 }))
+  end
+  local added = tonumber(row.dataAdded) or 0
+  if added > 0 then
+    table.insert(headline, ui.label({
+      text = tr("panel.label.added", { size = restic.humanBytes(added) }),
+      color = "primary",
+      fontSize = 11,
+    }))
+  end
+  table.insert(headline, ui.spacer({ flexGrow = 1 }))
+  if tags ~= "" then
+    table.insert(headline, ui.label({ text = tags, color = "on_surface/0.5", fontSize = 11, maxLines = 1 }))
+  end
+
   return ui.row({ key = "row-" .. id, gap = 8, align = "center", padding = 6 }, {
     ui.column({ gap = 2, flexGrow = 1 }, {
-      ui.label({ text = tostring(row.time or "?") .. tags, fontSize = 12 }),
+      ui.row({ gap = 8, align = "center" }, headline),
       ui.label({
         text = tr("panel.row.meta", {
           host = tostring(row.hostname or "?"),
@@ -702,14 +748,17 @@ local function snapshotRow(row)
         }),
         color = "on_surface/0.5",
         fontSize = 11,
+        maxLines = 1,
       }),
     }),
     -- A visible Restore button keeps the (now two-step) flow discoverable without right-clicking.
+    -- Ghost, not secondary: twenty-two filled accent buttons down one edge is the loudest thing
+    -- on the panel and it is the least informative part of it.
     ui.button({
       key = "restore-" .. id,
       text = tr("panel.action.restore"),
       glyph = "arrow-back-up",
-      variant = "secondary",
+      variant = "ghost",
       controlSize = "sm",
       onClick = function()
         startRestore(row)
@@ -933,6 +982,93 @@ local function diffSection()
   return out
 end
 
+-- ── history strip + hero (0.5.0) ─────────────────────────────────────────────
+-- A backup repository is a time series and this is its shape: one bar per snapshot, as tall as
+-- the bytes that snapshot actually added. Twenty-two flat hours and one spike answers "is this
+-- working, and has anything changed?" far better than twenty-two rows of text -- and it costs one
+-- ui.box per snapshot, with no graph, no normalisation and no new service state.
+
+local STRIP_BARS = 24
+local STRIP_FLOOR = 4
+local STRIP_CEIL = 30
+
+-- The newest STRIP_BARS snapshots, oldest first, so the strip reads left to right in time.
+local function stripRows()
+  local rows = allRows()
+  if #rows < 2 then
+    return nil
+  end
+  local ordered = {}
+  for index = #rows, 1, -1 do
+    table.insert(ordered, rows[index])
+  end
+  while #ordered > STRIP_BARS do
+    table.remove(ordered, 1)
+  end
+  return ordered
+end
+
+local function historyStrip()
+  local ordered = stripRows()
+  if ordered == nil then
+    return nil
+  end
+  local top = 0
+  for _, row in ipairs(ordered) do
+    local added = tonumber(row.dataAdded) or 0
+    if added > top then
+      top = added
+    end
+  end
+  local bars = {}
+  for _, row in ipairs(ordered) do
+    local added = tonumber(row.dataAdded) or 0
+    local height = STRIP_FLOOR
+    if top > 0 and added > 0 then
+      height = STRIP_FLOOR + math.floor((STRIP_CEIL - STRIP_FLOOR) * (added / top))
+    end
+    table.insert(bars, ui.box({
+      width = 9,
+      height = height,
+      radius = 2,
+      fill = added > 0 and "primary" or "on_surface/0.2",
+    }))
+  end
+  return ui.row({ key = "history-strip", gap = 2, align = "end" }, bars)
+end
+
+-- What the strip means, in numbers. restic walks the whole backup set every run and stores only
+-- what changed, so "nothing changed" is the good outcome -- the panel says so rather than leaving
+-- the user to wonder whether a flat strip means broken.
+local function historyHero()
+  local rows = allRows()
+  if #rows == 0 then
+    return nil
+  end
+  local stored, walked = 0, 0
+  for _, row in ipairs(rows) do
+    stored = stored + (tonumber(row.dataAdded) or 0)
+    walked = walked + (tonumber(row.bytesProcessed) or 0)
+  end
+  return ui.column({ key = "history-hero", gap = 2 }, {
+    ui.label({
+      key = "history-stored",
+      text = tr("panel.history.stored", {
+        stored = restic.humanBytes(stored),
+        walked = restic.humanBytes(walked),
+        count = tostring(#rows),
+      }),
+      fontSize = 12,
+    }),
+    ui.label({
+      key = "history-note",
+      text = tr("panel.history.note"),
+      color = "on_surface/0.5",
+      fontSize = 11,
+    }),
+  })
+end
+
 local function snapshotsTab()
   local list = allRows()
   local visible = visibleRows()
@@ -979,6 +1115,15 @@ local function snapshotsTab()
     }),
   }))
 
+  local strip = historyStrip()
+  if strip ~= nil then
+    table.insert(children, strip)
+  end
+  local hero = historyHero()
+  if hero ~= nil then
+    table.insert(children, hero)
+  end
+
   table.insert(children, ui.row({ gap = 8, align = "center" }, {
     ui.label({
       key = "snapshot-count",
@@ -1017,11 +1162,26 @@ local function snapshotsTab()
     }))
   else
     local shown = 0
+    local day = nil
     for _, row in ipairs(visible) do
       if shown >= MAX_ROWS then
         break
       end
       shown = shown + 1
+      -- One heading per calendar day. The row headline is recency now, so the absolute date has
+      -- to live somewhere -- and grouping does the work as well: hourly rows read as structure
+      -- instead of an undifferentiated wall of near-identical lines.
+      local rowDay = type(row.time) == "string" and row.time:sub(1, 10) or ""
+      if rowDay ~= "" and rowDay ~= day then
+        day = rowDay
+        table.insert(items, ui.label({
+          key = "day-" .. rowDay,
+          text = rowDay,
+          color = "on_surface/0.5",
+          fontSize = 11,
+          fontWeight = "bold",
+        }))
+      end
       table.insert(items, snapshotEntry(row))
     end
   end
@@ -1281,6 +1441,32 @@ local function verifyBlock(running)
   return ui.column({ key = "verify-block", gap = 4, padding = 10 }, children)
 end
 
+-- Time to the next backup, as a bar that fills across the interval. The panel already states
+-- this in words; the bar is the one element on the panel that visibly advances on its own, and
+-- "is my next backup actually coming?" is the question a backup tool exists to answer.
+local function countdownBar(running)
+  if running == true then
+    return nil
+  end
+  local nextAt = tonumber(status.nextRun)
+  if nextAt == nil or nextAt <= 0 then
+    return nil
+  end
+  -- With no recorded last run there is no interval to fill, so the bar reads empty rather than
+  -- inventing a start it does not have.
+  local last = type(status.lastRun) == "table" and tonumber(status.lastRun.at) or nil
+  local progress = 0
+  if last ~= nil and nextAt > last then
+    progress = 1 - ((nextAt - nowSec()) / (nextAt - last))
+    if progress < 0 then
+      progress = 0
+    elseif progress > 1 then
+      progress = 1
+    end
+  end
+  return ui.progress({ key = "countdown", progress = progress, height = 6 })
+end
+
 local function runTab()
   local cfg = config()
   local children = {}
@@ -1378,6 +1564,10 @@ local function runTab()
   -- The verification block stays visible while a job runs (with its button disabled): it is the last
   -- result, and blanking it mid-job would hide the very thing the user opened the tab to read.
   table.insert(children, verifyBlock(running))
+  local countdown = countdownBar(running)
+  if countdown ~= nil then
+    table.insert(children, countdown)
+  end
   table.insert(children, ui.label({
     key = "next-run",
     text = tr("panel.run.scheduled", { when = schedule.untilLabel(nowSec(), status.nextRun) }),
@@ -1455,15 +1645,18 @@ local function retentionTab()
       key = "preview-counts",
       text = tr("panel.prune.keep_remove", { keep = tostring(keepCount), remove = tostring(removeCount) }),
     }),
-    ui.label({
+  }))
+
+  if removeCount > 0 then
+    -- The note promises a confirmation "below", so it renders only when that confirmation can
+    -- appear. With nothing to remove there is no control to point at, and an instruction aimed
+    -- at a control that cannot exist is worse than no instruction.
+    table.insert(children, ui.label({
       key = "preview-note",
       text = tr("panel.prune.note"),
       color = "on_surface/0.5",
       fontSize = 12,
-    }),
-  }))
-
-  if removeCount > 0 then
+    }))
     table.insert(children, ui.label({
       key = "preview-remove-list-title",
       text = tr("panel.prune.remove_list"),
@@ -1939,7 +2132,11 @@ local function tabChip(id, label)
   return ui.button({
     key = "tab-" .. id,
     text = label,
-    variant = ui_state.tab == id and "primary" or "ghost",
+    -- `selected` is the vocabulary's active-tab signal. Swapping `variant` to primary made the
+    -- active tab a solid accent block that competed with the panel's one real primary action.
+    variant = "ghost",
+    selected = ui_state.tab == id,
+    controlSize = "sm",
     onClick = function()
       showTab(id)
     end,
@@ -1973,8 +2170,12 @@ function render()
       ui.spacer({ flexGrow = 1 }),
       ui.button({
         key = "close",
-        text = tr("panel.action.close"),
+        -- The x glyph every other surface in this plugin uses for dismiss, rather than the word
+        -- "Close" rendered as flat text that reads like a fifth tab.
+        glyph = "x",
         variant = "ghost",
+        controlSize = "sm",
+        tooltip = tr("panel.action.close"),
         onClick = function()
           panel.close()
         end,
