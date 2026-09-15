@@ -878,6 +878,32 @@ finishJob = function(job, exitCode, text)
   -- run's outcome and its check/verify payload. Never from the tick, and never able to fail the
   -- job: writeMetrics logs at most once per failure streak and returns.
   writeMetrics()
+
+  -- [0.6.2] A forget invalidates the preview on screen. It lists the snapshots that have just been
+  -- removed and offers a button that would prune them a second time, so leaving it up is not merely
+  -- stale text -- it is an armed action against state that no longer exists. Re-running the dry run
+  -- re-states the policy against the repository as it now is, which is normally "keep N, remove 0"
+  -- and clears the list and the button by itself.
+  --
+  -- Here, at the end, because startJob refuses while a job is still active and activeJob is only
+  -- cleared above. Unconditional rather than success-only: when the forget fails nothing was
+  -- removed, and the fresh run is what shows that, where the old counts would sit there claiming
+  -- otherwise.
+  if kind == "forget" or kind == "forget-one" then
+    if cfg ~= nil and resticPath ~= nil then
+      -- startJob clears status.error as it starts, so the forget's own outcome is carried across it:
+      -- a failed prune must not lose the message that explains it the instant the preview restarts.
+      local forgetOutcome = status.error
+      local restarted, restartErr = startJob("forget-dry", restic.forgetArgs(cfg, resticPath, true))
+      if restarted then
+        status.error = forgetOutcome
+      elseif forgetOutcome == "" and restartErr ~= nil then
+        -- Only when the forget left no message of its own: a preview that could not restart is worth
+        -- reporting, but never at the cost of the failure the user actually needs to read.
+        status.error = restartErr
+      end
+    end
+  end
 end
 
 -- [0.4.0] The Log tab is live while a run is in flight. `publishJobLog` only knows about the

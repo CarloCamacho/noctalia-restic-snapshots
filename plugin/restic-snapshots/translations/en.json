@@ -108,6 +108,7 @@
   "panel.logs.scan": "scanned {files} files",
   "panel.logs.truncated": "log truncated to the last {lines} lines",
   "panel.message.copied_id": "Copied snapshot id {id}",
+  "panel.prune.applying": "Applying the policy; the list refreshes when it finishes.",
   "panel.prune.keep_remove": "Would keep {keep}, remove {remove}",
   "panel.prune.note": "Removal only runs after you confirm below.",
   "panel.prune.remove_list": "Snapshots that would be removed:",

@@ -811,6 +811,21 @@ clickTab("retention")
 check("a tab switch drops the pending prune confirmation",
   H.text(H.tree):find("Confirm: prune", 1, true) == nil, H.text(H.tree))
 
+-- Confirming must not leave the stale list standing. The rows name the snapshots this prune is about
+-- to remove and the button would prune them a second time, so a list that outlives its own prune is
+-- an armed action, not just stale text.
+nodeByKey("prune").props.onClick() -- arm
+nodeByKey("prune").props.onClick() -- confirm
+check("confirming asks for the real prune and not another dry run",
+  lastCommand():find("forget", 1, true) ~= nil and lastCommand():find("dry-run", 1, true) == nil,
+  lastCommand())
+check("confirming clears the list, the counts and the button at once",
+  nodeByKey("prune") == nil and nodeByKey("removal-scroll") == nil
+    and nodeByKey("preview-counts") == nil)
+check("the panel says what is happening while the prune runs",
+  H.text(H.tree):find("Applying the policy", 1, true) ~= nil, H.text(H.tree))
+
+
 -- A failed preview never offers prune.
 publish("restic_job", { kind = "forget-dry", at = 1788874602, ok = false })
 text = H.text(H.tree)

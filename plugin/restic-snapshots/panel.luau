@@ -1704,6 +1704,12 @@ local function retentionTab()
         if ui_state.confirmPrune then
           send(state.EVENT_FORGET)
           ui_state.confirmPrune = false
+          -- [0.6.2] The list on screen names the snapshots this prune is removing, so it stops being
+          -- true the moment the button is pressed. Clear it rather than leaving it standing with its
+          -- button armed for the length of the job: the service re-runs the preview when the prune
+          -- finishes and publishes the policy against the repository as it then is.
+          job = nil
+          ui_state.message = tr("panel.prune.applying")
           render()
         else
           ui_state.confirmPrune = true

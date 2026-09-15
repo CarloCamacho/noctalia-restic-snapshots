@@ -1545,5 +1545,58 @@ do
   check("no job active means no log publish", H.published["restic_joblog"] == finished)
 end
 
+print("== the retention preview is invalidated by the prune that acts on it")
+
+do
+  -- Started jobs whose script runs a forget dry run (the subcommand plus --dry-run).
+  local function dryRunJobs()
+    local count = 0
+    for _, cmd in ipairs(H.commands) do
+      if cmd[1] == "/bin/sh" then
+        local script = H.files[cmd[2]] or ""
+        if script:find("'forget'", 1, true) ~= nil
+            and script:find("'--dry-run'", 1, true) ~= nil then
+          count = count + 1
+        end
+      end
+    end
+    return count
+  end
+
+  boot({ interval_minutes = 5 })
+  drain()
+
+  -- A preview on screen: one snapshot to keep, one to remove.
+  onIpc("forget-dry-run")
+  exitJob('{"keep":[{"id":"aaaa1111","short_id":"aaaa1111","time":"2026-09-08T13:36:42+00:00"}],'
+    .. '"remove":[{"id":"bbbb2222","short_id":"bbbb2222","time":"2026-09-08T03:36:42+00:00"}],'
+    .. '"reasons":{}}\n', 0)
+  local preview = H.published["restic_job"]
+  check("a preview with something to remove is on screen before the prune",
+    preview ~= nil and preview.kind == "forget-dry" and preview.removeCount == 1,
+    preview and tostring(preview.removeCount))
+
+  local dryRuns = dryRunJobs()
+
+  -- Confirm the prune: it runs for real, and finishes successfully.
+  onIpc("forget")
+  check("the confirmed prune runs restic forget with --prune",
+    scriptText():find("'--prune'", 1, true) ~= nil, scriptText():sub(1, 120))
+  exitJob('{"message_type":"summary","total_files":0}\n', 0)
+
+  -- [0.6.2] The list on screen described the repository BEFORE this prune. Left standing it offers a
+  -- second prune of snapshots that are already gone, against counts nothing has recomputed.
+  check("applying the policy re-runs the dry run, so the preview cannot outlive the prune it acted on",
+    dryRunJobs() == dryRuns + 1, tostring(dryRuns) .. " -> " .. tostring(dryRunJobs()))
+
+  -- And the refreshed preview reports the policy against the repository as it now is.
+  exitJob('{"keep":[{"id":"aaaa1111","short_id":"aaaa1111","time":"2026-09-08T13:36:42+00:00"}],'
+    .. '"remove":null,"reasons":{}}\n', 0)
+  local after = H.published["restic_job"]
+  check("the refreshed preview reports what is left, not what was removed",
+    after ~= nil and after.kind == "forget-dry" and after.removeCount == 0 and after.keepCount == 1,
+    after and (tostring(after.keepCount) .. " keep / " .. tostring(after.removeCount) .. " remove"))
+end
+
 print(string.format("\n%s -- %d failure(s)", failures == 0 and "ALL PASS" or "FAILURES", failures))
 os.exit(failures == 0 and 0 or 1)
