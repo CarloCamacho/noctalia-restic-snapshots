@@ -99,6 +99,33 @@ check("the status case arm closes its pattern",
   script:find("*'\"message_type\":\"status\"'*) printf", 1, true) ~= nil, tostring(statusCase))
 local logCase = lineContaining(script, '"$line" >> "$logfile"')
 check("everything else is appended to the log", logCase ~= nil, tostring(logCase))
+
+-- [0.6.0] `backup --json --verbose` emits one verbose_status per file AND per directory. The
+-- `unchanged` ones are the overwhelming majority of a quiet run and say nothing the summary does not
+-- -- a no-op hourly backup is ~260 of them -- so the script drops them before they reach the log the
+-- panel reads. Dropping them HERE, in the job script, is what keeps a quiet run's log at a handful of
+-- lines while a run that changed something still names the files it changed.
+local unchangedCase = lineContaining(script, '"action":"unchanged"')
+check("script drops the unchanged verbose records", unchangedCase ~= nil, tostring(unchangedCase))
+check("the unchanged arm writes nothing at all",
+  unchangedCase ~= nil and unchangedCase:find("logfile", 1, true) == nil
+    and unchangedCase:find("statusfile", 1, true) == nil, tostring(unchangedCase))
+-- A missing `)` is a shell syntax error only a real shell catches, so the arm's shape is pinned.
+check("the unchanged case arm closes its pattern",
+  script:find("*'\"action\":\"unchanged\"'*", 1, true) ~= nil, tostring(unchangedCase))
+-- Order matters: a status line must still be taken by the status arm, and the catch-all stays last.
+-- Each arm is located by its WHOLE line. A fragment search does not work here: `*) printf` also
+-- occurs inside the status arm -- its pattern ends `*` and the very next characters are `) printf`
+-- -- so a fragment match measures the status arm and reports the catch-all as earlier than it is.
+local statusArm = lineContaining(script, '"message_type":"status"')
+local unchangedArm = lineContaining(script, '"action":"unchanged"')
+local catchAllArm = lineContaining(script, '"$line" >> "$logfile"')
+local statusAt = statusArm ~= nil and script:find(statusArm, 1, true) or 0
+local unchangedAt = unchangedArm ~= nil and script:find(unchangedArm, 1, true) or 0
+local catchAllAt = catchAllArm ~= nil and script:find(catchAllArm, 1, true) or 0
+check("the case arms are ordered status, then unchanged, then catch-all",
+  statusAt > 0 and unchangedAt > statusAt and catchAllAt > unchangedAt,
+  tostring(statusAt) .. "/" .. tostring(unchangedAt) .. "/" .. tostring(catchAllAt))
 check("no env file means no sourcing line", script:find("set -a", 1, true) == nil)
 
 -- ── script generation: env file ──────────────────────────────────────────────

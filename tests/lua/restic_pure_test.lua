@@ -316,6 +316,26 @@ check("snapshots: --no-lock is a global flag before the subcommand",
   indexOf(snap, "--no-lock") > 0 and indexOf(snap, "--no-lock") < indexOf(snap, "snapshots"), table.concat(snap, " "))
 check("snapshots: --json", indexOf(snap, "--json") > 0)
 
+-- [0.6.0] `backup --verbose` so the job log records what the run did to each file. Without it a
+-- `backup --json` log is a single summary object (473 bytes, identical every hour) and the Log tab
+-- has nothing to show; with it restic emits one verbose_status per file and directory, and the job
+-- script drops the unchanged ones. The blast radius is deliberate: only backup, because only backup
+-- has per-file actions worth recording.
+local backupArgv = restic.backupArgs(cfg, BIN)
+check("backup: --verbose", indexOf(backupArgv, "--verbose") > 0, table.concat(backupArgv, " "))
+check("backup: --verbose comes with --json, after the subcommand",
+  indexOf(backupArgv, "--verbose") > indexOf(backupArgv, "backup")
+    and indexOf(backupArgv, "--json") > 0, table.concat(backupArgv, " "))
+local verboseCount = 0
+for _, item in ipairs(backupArgv) do
+  if item == "--verbose" then
+    verboseCount = verboseCount + 1
+  end
+end
+check("backup asks for --verbose exactly once", verboseCount == 1, tostring(verboseCount))
+check("no other command asks restic for verbose output",
+  indexOf(snap, "--verbose") == 0, table.concat(snap, " "))
+
 local statsArgv = restic.statsArgs(cfg, BIN)
 check("stats: --no-lock before stats",
   indexOf(statsArgv, "stats") > 0 and indexOf(statsArgv, "--no-lock") < indexOf(statsArgv, "stats"))

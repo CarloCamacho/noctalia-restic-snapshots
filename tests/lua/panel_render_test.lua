@@ -1300,6 +1300,24 @@ check("a log bigger than the read bound is read as its last 16 KiB",
 check("the partial first line the bound cut in half is dropped, not shown",
   labelWith("FRAGMENTVALUE") == nil, "FRAGMENTVALUE is rendered")
 
+-- ── per-file lines in the log (0.6.0) ───────────────────────────────────────
+-- `backup --verbose` gives the formatter file records, and this panel is the only place in the
+-- plugin that can name the file a run changed.
+
+showLog("backup-verbose-modified.jsonl")
+check("the log names the file the run changed",
+  H.text(H.tree):find("one.txt", 1, true) ~= nil, H.text(H.tree))
+check("the log says what happened to that file",
+  H.text(H.tree):find("modified", 1, true) ~= nil, H.text(H.tree))
+check("the scan record reads as what restic examined, not as a file with a blank path",
+  H.text(H.tree):find("scanned", 1, true) ~= nil, H.text(H.tree))
+check("a verbose log is not announced as nothing to show", nodeByKey("joblog-empty") == nil)
+
+showLog("backup-verbose-new.jsonl")
+check("a first backup reports the files it added",
+  H.text(H.tree):find("new", 1, true) ~= nil and H.text(H.tree):find("two.txt", 1, true) ~= nil,
+  H.text(H.tree))
+
 -- ── the empty state: a missing or unreadable log is a message ────────────────
 H.files[LOG_PATH] = nil
 H.mtimes[LOG_PATH] = nil

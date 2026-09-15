@@ -25,6 +25,8 @@ JSONL_FIXTURES = [
     "backup-summary.jsonl",
     "backup-progress.jsonl",
     "backup-unchanged.jsonl",
+    "backup-verbose-new.jsonl",
+    "backup-verbose-modified.jsonl",
     "check-summary.jsonl",
     "error.jsonl",
     "ls-list.jsonl",
@@ -34,6 +36,20 @@ JSONL_FIXTURES = [
 
 def raw(name):
     return (FIXTURES / name).read_bytes()
+
+
+def message_types(name):
+    """How many records of each message_type the fixture carries."""
+    counts = {}
+    for record in records(name):
+        key = record.get("message_type", "?")
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def actions(name):
+    """The distinct verbose_status actions in the fixture."""
+    return {record["action"] for record in records(name) if "action" in record}
 
 
 def records(name):
@@ -47,6 +63,63 @@ def records(name):
         except json.JSONDecodeError as error:  # pragma: no cover - the failure is the assertion
             raise AssertionError(f"{name}:{number} is not JSON: {error}") from error
     return out
+
+
+class TestVerboseFixtures(unittest.TestCase):
+    """`backup --json --verbose` (0.6.0): one verbose_status per file and per directory.
+
+    Captured on restic 0.19.1 against a throwaway repository under /tmp -- `-new` is a first backup,
+    `-modified` is a later run with one edited file. These fixtures exist because without --verbose a
+    backup log is the single 473-byte summary above, which left the Log tab with nothing to show.
+
+    The formatter reads exactly two fields from each of these records, `action` and `item`, so both
+    are pinned here: a restic release that renamed either would otherwise turn the lua expectations
+    into assertions about a `nil`.
+    """
+
+    NAMES = ("backup-verbose-new.jsonl", "backup-verbose-modified.jsonl")
+
+    def test_every_verbose_record_carries_the_two_fields_the_formatter_reads(self):
+        for name in self.NAMES:
+            for index, record in enumerate(records(name), start=1):
+                if record["message_type"] != "verbose_status":
+                    continue
+                self.assertIn("action", record, f"{name}:{index}")
+                self.assertIn("item", record, f"{name}:{index}")
+                self.assertIsInstance(record["action"], str, f"{name}:{index}")
+                self.assertIsInstance(record["item"], str, f"{name}:{index}")
+
+    def test_the_new_fixture_is_a_first_backup(self):
+        self.assertEqual(message_types("backup-verbose-new.jsonl")["summary"], 1)
+        seen = actions("backup-verbose-new.jsonl")
+        self.assertIn("new", seen)
+        self.assertNotIn("modified", seen)
+
+    def test_the_modified_fixture_has_a_changed_file_a_quiet_one_and_a_scan(self):
+        self.assertEqual(message_types("backup-verbose-modified.jsonl")["summary"], 1)
+        seen = actions("backup-verbose-modified.jsonl")
+        self.assertIn("modified", seen)
+        self.assertIn("unchanged", seen)
+        self.assertIn("scan_finished", seen)
+
+    def test_scan_finished_carries_no_item_and_a_file_count(self):
+        """Why the formatter may not assume every verbose record names a path."""
+        scans = [
+            record for record in records("backup-verbose-modified.jsonl")
+            if record.get("action") == "scan_finished"
+        ]
+        self.assertEqual(len(scans), 1, "one scan per run")
+        self.assertEqual(scans[0]["item"], "", "scan_finished names no file")
+        self.assertGreater(scans[0]["total_files"], 0)
+
+    def test_the_modified_fixture_carries_both_files_and_directories(self):
+        """Directories are reported too, with a trailing slash; the formatter shows them as they are."""
+        items = [
+            record["item"] for record in records("backup-verbose-modified.jsonl")
+            if record.get("action") == "modified"
+        ]
+        self.assertTrue(any(item.endswith("/") for item in items), items)
+        self.assertTrue(any(not item.endswith("/") for item in items), items)
 
 
 class TestBackupFixtures(unittest.TestCase):

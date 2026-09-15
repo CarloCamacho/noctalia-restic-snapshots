@@ -158,7 +158,10 @@ def check_args(cfg, subset_override=None):
 
 
 def backup_args(cfg):
-    argv = base_args(cfg) + ["backup"] + list(cfg["backup_paths"]) + ["--json"]
+    # --verbose (0.6.0): one verbose_status record per file and per directory, so the job log can
+    # name what a run changed. Without it `backup --json` writes a single summary object and the Log
+    # tab has nothing to show. The job script drops the `unchanged` records. Only backup asks for it.
+    argv = base_args(cfg) + ["backup"] + list(cfg["backup_paths"]) + ["--json", "--verbose"]
     for tag in cfg["backup_tags"]:
         argv += ["--tag", tag]
     if cfg["exclude_file"]:

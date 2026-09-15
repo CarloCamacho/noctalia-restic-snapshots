@@ -465,5 +465,77 @@ do
   check("two calls with the same input agree", same)
 end
 
+-- ── per-file records: `backup --json --verbose` (0.6.0) ──────────────────────
+-- Without --verbose a backup log is one summary object and the Log tab has nothing to show. With it
+-- restic emits one verbose_status per file AND per directory, and the job script drops the
+-- `unchanged` ones, so what the formatter sees is the short list of what the run actually did.
+-- Both fixtures are real captures from a throwaway repository.
+
+print("== a --verbose backup log (tests/fixtures/backup-verbose-*)")
+
+do
+  local out = format(fixture("backup-verbose-modified.jsonl"))
+  check("the verbose log formats", out ~= nil and #out.display > 0, out and tostring(#out.display))
+
+  local changed = nil
+  for _, line in ipairs(out.display) do
+    if kindOf(line) == "file" and line.action == "modified" and type(line.path) == "string"
+        and line.path:find("one.txt", 1, true) ~= nil then
+      changed = line
+    end
+  end
+  check("the file the run changed becomes a file line naming its path", changed ~= nil)
+  check("the file line carries restic's own action word",
+    changed ~= nil and changed.action == "modified", changed and tostring(changed.action))
+  check("a directory record is kept, trailing slash and all",
+    (function()
+      for _, line in ipairs(out.display) do
+        if kindOf(line) == "file" and type(line.path) == "string" and line.path:sub(-1) == "/" then
+          return true
+        end
+      end
+      return false
+    end)())
+  check("the summary still renders beside the file lines", first(out, "backup") ~= nil)
+  check("file lines are not folded into a records count", countKind(out, "records") == 0,
+    tostring(countKind(out, "records")))
+
+  -- scan_finished is the one action with no item: it must not become a file line with an empty path.
+  local scan = first(out, "scan")
+  check("scan_finished is typed as a scan, not as a file", scan ~= nil)
+  check("the scan line carries the number of files restic examined",
+    scan ~= nil and scan.files == 2, scan and tostring(scan.files))
+  check("no file line was made from the item-less scan record",
+    (function()
+      for _, line in ipairs(out.display) do
+        if kindOf(line) == "file" and line.path == nil then
+          return false
+        end
+      end
+      return true
+    end)())
+
+  local newOut = format(fixture("backup-verbose-new.jsonl"))
+  local added = nil
+  for _, line in ipairs(newOut.display) do
+    if kindOf(line) == "file" and line.action == "new" then
+      added = line
+      break
+    end
+  end
+  check("a first backup reports the files it added", added ~= nil)
+  check("an added file is typed new with its path",
+    added ~= nil and added.action == "new" and type(added.path) == "string",
+    added and tostring(added.path))
+
+  -- An action this formatter has never seen must still be shown: a file the run touched cannot
+  -- vanish because the panel had not heard of the verb.
+  local unknown = format('{"message_type":"verbose_status","action":"invented_later","item":"/tmp/x"}')
+  local line = unknown ~= nil and unknown.display[1] or nil
+  check("an unknown action is passed through, not dropped",
+    line ~= nil and line.kind == "file" and line.action == "invented_later",
+    line and tostring(line.action))
+end
+
 print(string.format("\n%s -- %d failure(s)", failures == 0 and "ALL PASS" or "FAILURES", failures))
 os.exit(failures == 0 and 0 or 1)
