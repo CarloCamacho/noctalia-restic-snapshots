@@ -658,6 +658,14 @@ end
 
 -- ── forget preview ───────────────────────────────────────────────────────────
 
+-- A forget --json group always carries at least one of these. It is what tells a real group record
+-- apart from a decoded *array* of groups, which is also a table and would otherwise pass the same
+-- test -- the confusion that produced the defect fixed below.
+local function isForgetGroup(value)
+  return type(value) == "table"
+    and (value.keep ~= nil or value.remove ~= nil or value.paths ~= nil or value.host ~= nil)
+end
+
 -- `forget --dry-run --json` returns one record per group (host+paths) with `keep`, `remove` and
 -- `reasons`. `reasons` lists every snapshot with the rule it matched, including kept ones, so the
 -- removed set is read from `remove` only (which is `null` when the group loses nothing).
@@ -668,13 +676,31 @@ function M.summariseForgetDry(objects, limit)
     return nil
   end
   local max = bound(limit, 50)
+
+  -- The caller does NOT hand us the array: it hands us what parseJsonLines produced, which wraps
+  -- each decoded LINE in a table. restic writes the whole forget array on a single line, so the
+  -- service passes { array } and, without this unwrap, the group test below is satisfied by the
+  -- WRAPPER: every "group" is really the array, group.keep is nil, and this function returns a
+  -- confident keepCount 0 / removeCount 0 for a repository with plenty to keep and to remove.
+  -- That is a destructive gate reporting "nothing to do" from an unreadable payload.
+  if #objects == 1 and type(objects[1]) == "table"
+    and (type(objects[1][1]) == "table" or next(objects[1]) == nil) then
+    objects = objects[1]
+  end
+
   local groups
-  if type(objects[1]) == "table" then
+  if isForgetGroup(objects[1]) then
     groups = objects
-  elseif objects.keep ~= nil or objects.remove ~= nil or objects.paths ~= nil then
+  elseif isForgetGroup(objects) then
     groups = { objects }
-  else
+  elseif next(objects) == nil then
+    -- An empty payload is restic saying "nothing matched", which is a real zero. It must stay a
+    -- zero: the panel renders it, and it is the honest answer.
     groups = {}
+  else
+    -- Non-empty, but neither a group nor a list of groups. Returning zeroes here would tell the
+    -- user there is nothing to prune; nil makes the caller report a failure instead.
+    return nil
   end
   local keepCount = 0
   local removeCount = 0

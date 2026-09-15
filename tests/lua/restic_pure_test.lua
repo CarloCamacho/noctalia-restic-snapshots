@@ -686,5 +686,24 @@ check("summariseForgetDry: an empty payload is zero, not an error",
   restic.summariseForgetDry({}, 50).removeCount == 0 and restic.summariseForgetDry({}, 50).keepCount == 0)
 check("summariseForgetDry: non-table input is nil", restic.summariseForgetDry("x") == nil)
 
+-- The shape the SERVICE passes is not the shape above. The service reads the job log with
+-- parseJsonLines (one decoded value per LINE) while these checks call parseObject (one decode of
+-- the whole text), and restic writes the forget array on a single line. So production passes
+-- { array } and the checks above never saw it -- which is how a panel came to report
+-- "Would keep 0, remove 0" for a repository holding 22 snapshots. Assert the real shape.
+local wrapped = { restic.parseObject(FORGET) }
+local dryWrapped = restic.summariseForgetDry(wrapped, 50)
+check("summariseForgetDry: the parseJsonLines wrapper is unwrapped, not read as one group",
+  dryWrapped ~= nil and dryWrapped.keepCount == 2 and dryWrapped.removeCount == 4,
+  dryWrapped == nil and "nil" or (tostring(dryWrapped.keepCount) .. "/" .. tostring(dryWrapped.removeCount)))
+check("summariseForgetDry: a wrapped empty payload is still a zero",
+  restic.summariseForgetDry({ {} }, 50) ~= nil
+    and restic.summariseForgetDry({ {} }, 50).keepCount == 0)
+check("summariseForgetDry: an unreadable non-empty payload is nil, never a false zero",
+  restic.summariseForgetDry({ { error = "repository is already locked" } }, 50) == nil)
+check("summariseForgetDry: a wrapped array is still bounded like a bare one",
+  restic.summariseForgetDry(wrapped, 2).removeCount == 4
+    and #restic.summariseForgetDry(wrapped, 2).remove == 2)
+
 print(string.format("\n%s -- %d failure(s)", failures == 0 and "ALL PASS" or "FAILURES", failures))
 os.exit(failures == 0 and 0 or 1)

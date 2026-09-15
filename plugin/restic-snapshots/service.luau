@@ -762,7 +762,10 @@ finishJob = function(job, exitCode, text)
     noctalia.state.set(state.KEY_JOB, {
       kind = "forget-dry",
       at = at,
-      ok = ok,
+      -- A preview whose counts could not be read is a FAILURE, not a preview of nothing. The
+      -- panel gates the entire prune flow on ok, so reporting ok with keepCount 0 leaves a
+      -- repository that needs pruning with no way to prune it and nothing to explain why.
+      ok = ok and preview ~= nil,
       keepCount = preview ~= nil and preview.keepCount or 0,
       removeCount = preview ~= nil and preview.removeCount or 0,
       remove = preview ~= nil and preview.remove or {},
