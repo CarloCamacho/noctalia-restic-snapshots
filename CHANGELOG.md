@@ -1,6 +1,80 @@
 # Changelog
 
-## 0.4.0 — unreleased
+## 0.5.0 — 2026-09-15
+
+The glanceability release. 0.4.0 made the plugin readable; the panel was still a table of
+near-identical rows, with the most interesting fact about the repository -- that it has been backing
+up for twenty-one hours and storing almost nothing -- nowhere on screen. This release gives the
+repository a shape, makes the retention preview tell the truth, and removes two warnings that fired
+on every load.
+
+### Added
+
+- **A history strip on the Snapshots tab.** One bar per snapshot, oldest to newest, as tall as the
+  bytes that snapshot actually added, accented when it added anything at all. Twenty-two flat hours
+  and one spike answers *is this working, and has anything changed?* at a glance. It is one
+  `ui.box` per snapshot: no graph, no normalisation, and no new service state, because
+  `summary.dataAdded` was already published in every snapshot row.
+- **A headline that says what those numbers mean** — *933 KiB stored, from 18.9 MiB scanned across
+  23 snapshots* — above the list. restic walks the whole backup set every run and stores only what
+  changed, so *nothing to back up* is the good outcome; the panel now says so rather than leaving a
+  flat strip to be read as a fault.
+- **A sparkline in the bar widget.** The same series beside the glyph, so the shape of the
+  repository is visible without opening anything. It reads the snapshots list rather than the status
+  payload, and a bar never reaches zero height: with hourly backups most values are legitimately
+  zero, and a line pinned along the floor is indistinguishable from a graph that failed to draw.
+- **A countdown bar on the Run tab** that fills across the interval to the next backup. The panel
+  already said *next scheduled run in 12m* in words; this is the one element on the panel that
+  visibly advances on its own.
+- **Date headings in the snapshot list**, one per calendar day.
+
+### Fixed
+
+- **The retention preview misreported what it would keep.** The panel showed *Would keep 0, remove
+  0* for a repository whose own `forget --dry-run` output says `keep: 2 snapshots, remove: null`, and
+  it would have done so for any policy: the counts were being read from a payload the plugin could
+  not parse. The service reads job logs with `parseJsonLines` (one decoded value per **line**) while
+  the unit test used `parseObject` (one decode of the whole text), and restic writes the entire
+  forget array on a single line — so production passed `{ array }`, the group test was satisfied by
+  the *wrapper*, every "group" was really the array, `group.keep` was nil, and the function returned
+  a confident zero. The array is now unwrapped at the boundary, and a payload that is neither a
+  group nor a list of groups returns `nil` so the panel reports a failure instead of a plausible
+  zero. A genuinely empty payload stays a zero: that is restic saying nothing matched. Measured on
+  both real job files on this machine: 0.4.0 reports *keep 0, remove 0*; 0.5.0 reports *keep 2,
+  remove 0*, matching restic exactly.
+- **Two warnings on every manifest load.**
+  `entry 'browser' setting 'browser_placement' shadows a plugin-level setting; entry value wins`,
+  and the same for `browser_position`. `plugin_panel_shell.cpp` only suppresses its own injected
+  copies when the **entry** already declares that key (`hasSettingKey` inspects `entry.settings`), so
+  a plugin-level declaration is not recognised as one: the host injected `browser_placement` anyway,
+  the entry's value then shadowed the plugin-level copy, and `plugin_manifest.cpp` warned on every
+  load while the plugin-level copies sat dead. Both are now declared as `[[panel.setting]]` on the
+  `browser` entry, so the labelled control from 0.4.0 is unchanged and the collision is gone.
+- **The prune note pointed at a control that could not exist.** *Removal only runs after you confirm
+  below* rendered even when nothing was to be removed and no confirmation could follow it.
+
+### Changed
+
+- **The snapshot headline is recency, not a 35-character nanosecond timestamp** — *21m ago ·
+  22:15:06*, with the bytes added called out when there are any. The absolute date moved to the day
+  heading, so it is still there when you are hunting for the snapshot from Tuesday.
+- **Tabs mark the active tab with `selected`** rather than repainting it `primary`; the accent block
+  competed with the panel's one real primary action.
+- **Close is the `x` glyph** rather than the word *Close* set as flat text beside four tabs.
+- **The per-snapshot Restore button is ghost, not secondary.** Twenty-two filled accent buttons down
+  one edge was the loudest thing on the panel and the least informative part of it. The button stays
+  visible and labelled, because the flow is two-step and discoverability matters more than quietness.
+- **The snapshot action sheet is width-constrained and right-aligned.** A bare `ui.column` stretches
+  its children and a button centres its content by default, so the sheet rendered as a full-width
+  stack of centred buttons. Its entries now left-align.
+
+### Notes
+
+- 0.4.0 is dated as released above; it was tagged `v0.4.0`, but `catalog.toml` was still advertising
+  **0.2.0**, and a git source reads that file — so the source index was two releases behind. It now
+  reads 0.5.0. This is the second time this repository has been bitten by a stale index.
+
+## 0.4.0 — 2026-09-15
 
 The readability release. Three things a user hit in the panel, all of them about seeing what the
 plugin actually did — and two of them limitations of the shell that the plugin had to work around.

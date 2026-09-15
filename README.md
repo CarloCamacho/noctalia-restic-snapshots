@@ -181,6 +181,22 @@ Typical workflows:
   `== post-backup command ==`, as does any error — errors are never folded away, however long the
   log is.
 
+### Reading the Snapshots tab
+
+The tab opens with the repository's shape rather than a wall of rows:
+
+- **A history strip** — one bar per snapshot, oldest to newest, as tall as the bytes that snapshot
+  actually added, and accented when it added anything at all. Because restic walks the whole backup
+  set every run and stores only what changed, a long flat strip with the occasional spike *is* the
+  healthy picture: the backups are running and your files are not changing.
+- **A headline** — *933 KiB stored, from 18.9 MiB scanned across 23 snapshots*. The gap between
+  those two numbers is what deduplication is doing for you.
+- **Date headings**, one per calendar day. Each row leads with recency (*21m ago · 22:15:06*) and
+  calls out the bytes it added, if any; the absolute date lives in the heading.
+
+The Run tab fills a bar across the interval to the next backup, and the bar widget carries the same
+history as a sparkline beside its glyph.
+
 ### Where the panel opens
 
 The panel is a normal plugin panel, so the shell places it: **Settings → Plugins → Restic Snapshots
@@ -475,8 +491,8 @@ settings page's advanced toggle.
 | `verify_interval_hours` | `int` | `0` (0–720) | How often to prove a backup can actually be restored. `0` disables scheduled verification; the Run tab's *Verify restore* button and the `verify-restore` IPC event still work. |
 | `verify_file_count` | `int` | `3` (1–25) | How many files a verification restores and compares. A value below 1 falls back to the default (3); above 25 it is clamped to 25. |
 | `metrics_dir` | `folder` | *(empty)* | Directory for the Prometheus textfile export (`restic_snapshots.prom`). Empty means the plugin writes nothing at all. See [Prometheus textfile export](#prometheus-textfile-export). *Advanced.* |
-| `browser_placement` | `select` | `floating` | Where this plugin's panel opens: `floating` (a centred window) or `attached` (docked to the bar). Read by the shell when the panel opens. |
-| `browser_position` | `select` | `center` | Where a floating panel is placed: `auto`, `center`, or a corner/edge (`top_left` … `bottom_right`). Ignored while the panel is attached. |
+| `browser_placement` | `select` | `floating` | Where this plugin's panel opens: `floating` (a centred window) or `attached` (docked to the bar). Read by the shell when the panel opens. Declared on the `browser` **panel entry**, not at plugin level: the shell injects its own copy of this key per panel entry unless the entry declares it, and two declarations of the same key produce a shadow warning on every load. |
+| `browser_position` | `select` | `center` | Where a floating panel is placed: `auto`, `center`, or a corner/edge (`top_left` … `bottom_right`). Ignored while the panel is attached. Panel entry setting, for the same reason as `browser_placement`. |
 
 **Widget settings** are configured where the widget is added (**Settings → Bar**), not on the plugin
 page:
@@ -651,6 +667,14 @@ test, so each has a committed guard:
 | Two glyph names that are not in the host's icon set rendered as blank boxes | `[WRN] [glyph] missing glyph: undo` / `arrow-up-down` in `~/.cache/noctalia/noctalia.log` | the names are `arrow-back-up` / `arrows-up-down`; the same invariant test checks every glyph name against the host's Tabler set |
 | A job log that is one enormous line was shown as empty when the byte bound landed inside it | reproduced in `tests/lua/jobs_readlog_test.lua` (a 200 KB single line) | the bounded tail is kept when there is no newline to cut at |
 
+**Defects found by running the plugin for real (0.5.0)** — both invisible to the tests that existed
+at the time, for a reason worth recording:
+
+| Defect | Evidence it was real | Guard |
+| --- | --- | --- |
+| The retention preview reported *keep 0, remove 0* for a repository whose own `forget --dry-run` output says `keep: 2, remove: null` | the plugin returned a **confident zero** from a payload it could not parse: the service reads logs with `parseJsonLines` (one decoded value per *line*), the test used `parseObject` (one decode of the whole text), and restic writes the entire forget array on **one line** — so production passed `{ array }` and the group test was satisfied by the wrapper | the array is unwrapped at the boundary; an unreadable non-empty payload returns `nil` so the panel reports a failure rather than a zero. `restic_pure_test` now asserts the **wrapped** shape, which is the shape the service actually passes |
+| `entry 'browser' setting 'browser_placement' shadows a plugin-level setting; entry value wins` on **every** manifest load | the host only suppresses its injected copies when the *entry* declares the key (`hasSettingKey` inspects `entry.settings`), so a plugin-level declaration was ignored and the entry's value shadowed it | both keys are declared as `[[panel.setting]]` on the `browser` entry. Proved side by side: `noctalia plugins lint` on 0.4.0 prints the two warnings, on 0.5.0 prints none |
+
 The whole suite, run from the repository root:
 
 ```bash
@@ -660,9 +684,11 @@ luac -p plugin/restic-snapshots/*.luau plugin/restic-snapshots/lib/*.luau   # sy
 noctalia plugins lint plugin/restic-snapshots   # manifest + entries
 ```
 
-All four are green on `release/0.3.0`: the gate passes 13 checks (syntax, the Python suite and ten Lua
-suites — including the 0.3.0 additions `verify_test`, `jobs_hooks_test`, `launcher_test`,
-`metrics_test`, `jobs_readlog_test`) and the manifest lint reports `0 errors, 0 warnings`.
+All four are green on `release/0.5.0`: `luac -p` parses all thirteen `.luau` files, the Python suite
+runs 100 tests (one skipped), the eleven Lua suites pass — including the 0.5.0 additions to
+`restic_pure_test` (the `parseJsonLines` wrapper shape that the retention defect hid behind),
+`panel_render_test` and `widget_render_test` — and `noctalia plugins lint` reports
+`0 errors, 0 warnings`.
 
 ## Notes
 
