@@ -1082,14 +1082,14 @@ check("a backup display line renders its counts, bytes and duration",
   H.text(H.tree))
 check("a check display line renders its error count",
   labelWith("0 errors") ~= nil)
-check("a records display line renders as a folded count",
-  labelWith("40 records") ~= nil)
+check("a records display line names the folded stream",
+  labelWith("40 records (ls)") ~= nil, H.text(H.tree))
 check("an error display line renders its message",
   labelWith("error: repository is already locked") ~= nil)
 check("a passed check is not coloured as a problem",
   labelWith("0 errors") ~= nil and labelWith("0 errors").props.color ~= "error")
 check("the folded note appears when lines were folded",
-  nodeText("logs-folded") == "3 progress lines folded", tostring(nodeText("logs-folded")))
+  nodeText("logs-folded") == "3 lines folded", tostring(nodeText("logs-folded")))
 check("the Formatted view does not render the raw JSON record",
   H.text(H.tree):find("message_type", 1, true) == nil, H.text(H.tree))
 

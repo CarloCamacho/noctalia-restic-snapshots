@@ -1599,16 +1599,24 @@ local function displayLine(line)
     -- dropped: a suggestion the user never sees is worse than slightly general wording. Reported to
     -- the lead as a missing key (panel.logs.check_prune).
     local text = tr("panel.logs.check", { errors = logNumber(line.errors) })
-    if line.suggestRepair == true or line.suggestPrune == true then
+    if line.suggestRepair == true then
       text = text .. tr("panel.logs.check_repair")
+    end
+    if line.suggestPrune == true then
+      text = text .. tr("panel.logs.check_prune")
     end
     if (tonumber(line.errors) or 0) > 0 then
       return text, "error"
     end
     return text, "on_surface/0.7"
   elseif kind == "records" then
-    -- `source` (ls / diff / find / stats) has no translation key. The count is what the line is for;
-    -- the records themselves have their own views (Files, Diff).
+    -- `source` (ls / diff / find / stats) names what was folded, so "40 records" says which kind.
+    if type(line.source) == "string" and line.source ~= "" then
+      return tr("panel.logs.records_source", {
+        count = logNumber(line.count),
+        source = line.source,
+      }), "on_surface/0.5"
+    end
     return tr("panel.logs.records", { count = logNumber(line.count) }), "on_surface/0.5"
   elseif kind == "error" then
     local message = type(line.message) == "string" and line.message or "?"
@@ -1660,8 +1668,12 @@ local function logTab()
       ui.label({ key = "joblog-empty", text = tr("panel.empty.logs"), color = "on_surface/0.6", flexGrow = 1 }),
       refresh,
     }))
-    -- en.json carries no key for a hint here ("the log appears after a job runs"), so the empty
-    -- state is left as it was and the missing key is reported to the lead rather than invented.
+    table.insert(children, ui.label({
+      key = "joblog-empty-hint",
+      text = tr("panel.empty.logs_hint"),
+      color = "on_surface/0.5",
+      fontSize = 11,
+    }))
     return children
   end
 
@@ -1670,18 +1682,23 @@ local function logTab()
     verdict = tr("panel.label.cancelled")
   elseif joblog.ok == true then
     verdict = tr("panel.label.ok")
+  elseif joblog.exitCode == nil then
+    -- A log published while the job is still running: nothing has failed yet. The running refresh
+    -- publishes ok = false (it has not succeeded) with no exit code, so without this the header
+    -- would call an in-flight backup "failed" and print a fabricated "exit 0".
+    verdict = tr("panel.label.running")
   else
     verdict = tr("panel.label.failed")
+  end
+  -- The exit code is only part of the header once there is one; a running job has none yet.
+  local headerParts = { tostring(joblog.kind or "job"), agoLabel(joblog.at), verdict }
+  if joblog.exitCode ~= nil then
+    table.insert(headerParts, tr("panel.logs.exit", { code = tostring(joblog.exitCode) }))
   end
   table.insert(children, ui.row({ gap = 8, align = "center" }, {
     ui.label({
       key = "joblog-header",
-      text = table.concat({
-        tostring(joblog.kind or "job"),
-        agoLabel(joblog.at),
-        verdict,
-        tr("panel.logs.exit", { code = tostring(joblog.exitCode or 0) }),
-      }, " · "),
+      text = table.concat(headerParts, " · "),
       fontWeight = "bold",
       fontSize = 12,
       flexGrow = 1,
