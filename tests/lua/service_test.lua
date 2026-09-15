@@ -411,18 +411,62 @@ local function promText()
   return H.files[PROM_PATH] or ""
 end
 
--- Does the published job log carry a line containing `needle`?
-local function logHas(needle)
-  local joblog = H.published["restic_joblog"]
-  if joblog == nil or type(joblog.lines) ~= "table" then
-    return false
+-- [0.4.0] The published job log is metadata plus the log's PATH, and never the log's text
+-- (docs/CONTRACTS-0.4.0.md 2.2). `lines`, `display` and `collapsed` were what made the service's
+-- update() tick allocate a 97 KB job's worth of tables, and the host killed that callback for it --
+-- so the shape is asserted, not just sampled: nothing outside the frozen set may appear.
+--
+-- A field whose value is nil is an absent key in a Lua table, which is why the running payload is
+-- checked as "no key outside the set" (it carries no exitCode because there is no exit code yet --
+-- inventing 0 would read as success) while a finished payload is checked as the exact six.
+local FROZEN_LOG_KEYS = {
+  at = true, cancelled = true, exitCode = true, kind = true, logPath = true, ok = true,
+}
+
+local function logPayloadKeys(joblog)
+  local keys = {}
+  if type(joblog) ~= "table" then
+    return keys
   end
-  for _, line in ipairs(joblog.lines) do
-    if tostring(line):find(needle, 1, true) ~= nil then
-      return true
+  for key in pairs(joblog) do
+    table.insert(keys, tostring(key))
+  end
+  table.sort(keys)
+  return keys
+end
+
+-- The payload publishes a reference: where the log is, the run's own metadata, and nothing of the
+-- log itself -- whatever the run is doing.
+local function noLogBody(label, joblog)
+  local extra = {}
+  for _, key in ipairs(logPayloadKeys(joblog)) do
+    if FROZEN_LOG_KEYS[key] ~= true then
+      table.insert(extra, key)
     end
   end
-  return false
+  check(label .. ": the payload carries only the frozen metadata keys, and no log text",
+    type(joblog) == "table" and #extra == 0 and type(joblog.logPath) == "string"
+      and joblog.lines == nil and joblog.display == nil and joblog.collapsed == nil,
+    "extra=" .. table.concat(extra, ",") .. " keys=" .. table.concat(logPayloadKeys(joblog), ","))
+end
+
+-- A finished payload carries all six: kind, when, ok, cancelled, exitCode and the log's path.
+local function fullLogPayload(label, joblog)
+  check(label .. ": the payload is the full frozen shape",
+    table.concat(logPayloadKeys(joblog), ",") == "at,cancelled,exitCode,kind,logPath,ok",
+    table.concat(logPayloadKeys(joblog), ","))
+end
+
+-- Does the log the published payload POINTS AT contain `needle`? The payload no longer carries the
+-- text, so this reads the file through the same host call the panel reads it with.
+local function logHas(needle)
+  local joblog = H.published["restic_joblog"]
+  local path = type(joblog) == "table" and joblog.logPath or nil
+  if type(path) ~= "string" then
+    return false
+  end
+  local text = noctalia.readFile(path)
+  return type(text) == "string" and text:find(needle, 1, true) ~= nil
 end
 
 local function scriptText()
@@ -567,8 +611,12 @@ do
   check("a timed-out job is reported as an error", logCount("error: Restic backup timed out") == 1,
     logCount("error: Restic backup timed out"))
   local joblog = H.published["restic_joblog"]
-  check("the timed-out job publishes its log", joblog ~= nil and joblog.kind == "backup"
-    and joblog.ok == false and joblog.exitCode == 124, joblog and joblog.kind)
+  check("the timed-out job publishes its log reference",
+    joblog ~= nil and joblog.kind == "backup" and joblog.ok == false
+      and joblog.exitCode == 124 and joblog.logPath == paths.log,
+    joblog and tostring(joblog.logPath))
+  noLogBody("a timed-out job", joblog)
+  fullLogPayload("a timed-out job", joblog)
 
   -- The ceiling is a timeout, not a downtime: the schedule has to keep working.
   local nextAt = status().nextRun
@@ -722,16 +770,21 @@ do
     status().error:lower():find("locked", 1, true) ~= nil, status().error)
 
   onIpc("backup-now")
-  exitJob('{"message_type":"summary","total_files_processed":12,'
-    .. '"total_bytes_processed":2048,"data_added":512}\n', 0)
+  local _, successPaths = lastJob()
+  local summaryText = '{"message_type":"summary","total_files_processed":12,'
+    .. '"total_bytes_processed":2048,"data_added":512}\n'
+  exitJob(summaryText, 0)
   check("a successful run clears status.error", status().error == "", status().error)
   check("a successful run is recorded ok", status().lastRun.ok == true)
   check("a successful run sets lastSuccessAt", status().lastSuccessAt == math.floor(H.nowMs / 1000),
     tostring(status().lastSuccessAt))
   check("a successful run publishes a readable log", (function()
     local joblog = H.published["restic_joblog"]
-    return joblog.lines ~= nil and #joblog.lines == 1 and joblog.truncated == false
+    return joblog ~= nil and joblog.logPath == successPaths.log
+      and noctalia.readFile(joblog.logPath) == summaryText
   end)())
+  noLogBody("a successful run", H.published["restic_joblog"])
+  fullLogPayload("a successful run", H.published["restic_joblog"])
   check("a successful run refreshes the snapshots", argvCalls("snapshots") >= 2)
 end
 
@@ -1196,6 +1249,7 @@ do
   drain()
 
   onIpc("init")
+  local _, initPaths = lastJob()
   check("init runs restic init", scriptText():find("'init'", 1, true) ~= nil)
   exitJob('{"message_type":"initialized","id":"abc","repository":"/tmp/repo"}\n', 0)
   check("a successful init clears initNeeded", status().initNeeded == false)
@@ -1204,9 +1258,11 @@ do
   -- job-log re-publishes the last job's log
   onIpc("job-log")
   local joblog = H.published["restic_joblog"]
-  check("job-log republishes the last job's log",
-    joblog ~= nil and joblog.kind == "init" and #joblog.lines == 1
-      and joblog.lines[1]:find("initialized", 1, true) ~= nil, joblog and joblog.kind)
+  check("job-log republishes the last job's log reference",
+    joblog ~= nil and joblog.kind == "init" and joblog.logPath == initPaths.log
+      and logHas("initialized"), joblog and tostring(joblog.logPath))
+  noLogBody("a republished init job", joblog)
+  fullLogPayload("a republished init job", joblog)
 end
 
 print("== the log viewer survives a restart")
@@ -1219,21 +1275,28 @@ do
   exitJob('{"message_type":"summary","total_files_processed":2}\n', 0)
   local logPath = paths.log
   check("the last log path is persisted", readState().lastLog == logPath, tostring(readState().lastLog))
-  local firstLines = H.published["restic_joblog"].lines
+  local firstPath = H.published["restic_joblog"].logPath
 
   restart({ interval_minutes = 5, job_timeout_minutes = 180 })
   drain()
   check("the persisted log is republished after a restart",
     H.published["restic_joblog"] ~= nil and H.published["restic_joblog"].kind == "backup"
-      and H.published["restic_joblog"].lines[1] == firstLines[1],
-    H.published["restic_joblog"] and tostring(H.published["restic_joblog"].kind))
+      and H.published["restic_joblog"].logPath == firstPath,
+    H.published["restic_joblog"] and tostring(H.published["restic_joblog"].logPath))
   check("the restart still knows the last run", status().lastRun ~= nil and status().lastRun.ok == true)
 
+  -- [0.4.0] The re-publish is a REFERENCE: the log file is deleted from the harness's file map, so
+  -- no read of it can succeed, and the payload must still publish its metadata and its path. This is
+  -- the tick-level proof that the service publishes where the log is, not its text (contract 2.3).
   H.files[logPath] = nil
   onIpc("job-log")
-  check("a re-publish with no log file left publishes an empty log rather than failing",
-    H.published["restic_joblog"] ~= nil and #H.published["restic_joblog"].lines == 0
-      and logCount("restic ipc error") == 0)
+  check("a re-publish with no log file left still publishes the metadata and the path",
+    H.published["restic_joblog"] ~= nil and H.published["restic_joblog"].kind == "backup"
+      and H.published["restic_joblog"].logPath == logPath
+      and logCount("restic ipc error") == 0,
+    H.published["restic_joblog"] and tostring(H.published["restic_joblog"].logPath))
+  noLogBody("a re-publish with the log gone", H.published["restic_joblog"])
+  fullLogPayload("a re-publish with the log gone", H.published["restic_joblog"])
 end
 
 print("== scheduled integrity checks")
@@ -1335,10 +1398,11 @@ do
   check("stats without a repository publishes nothing", H.published["restic_stats"] == nil)
 end
 
-print("== a finished job publishes a readable log")
+print("== a finished job publishes a reference to its log, not the log")
 
 do
-  -- The real 473-byte one-line log from this machine: it used to BE the Log tab.
+  -- The real 473-byte one-line log from this machine: it used to BE the Log tab, formatted here and
+  -- copied into the published payload from this callback. It is now the panel's file to read.
   local summary = readFixture("backup-summary.jsonl")
   boot({ interval_minutes = 1440, check_interval_hours = 0 })
   drain()
@@ -1348,68 +1412,58 @@ do
   exitJob(summary, 0)
 
   local joblog = H.published["restic_joblog"]
-  check("the finished job publishes a formatted log",
-    type(joblog) == "table" and type(joblog.display) == "table" and #joblog.display == 1,
-    joblog and tostring(#(joblog.display or {})))
-  local line = joblog.display[1]
-  check("the line is typed, not a JSON blob", line ~= nil and line.kind == "backup",
-    line and line.kind)
-  check("the numbers are restic's own",
-    line ~= nil and line.filesUnmodified == 173 and line.bytesProcessed == 860367
-      and math.abs(line.durationSeconds - 1.167760836) < 1e-9,
-    line and tostring(line.filesUnmodified))
-  check("a one-line log folds nothing", joblog.collapsed == 0, tostring(joblog.collapsed))
-  check("the raw lines are still published for the Raw view",
-    type(joblog.lines) == "table" and #joblog.lines == 1, tostring(#(joblog.lines or {})))
-  check("the other published fields are untouched",
+  check("the finished job publishes the log's path",
+    type(joblog) == "table" and joblog.logPath == paths.log, joblog and tostring(joblog.logPath))
+  noLogBody("a finished job", joblog)
+  fullLogPayload("a finished job", joblog)
+  check("the published path is the log the runner wrote",
+    noctalia.readFile(joblog.logPath) == summary)
+  check("the run's own metadata is untouched",
     joblog.kind == "backup" and joblog.ok == true and joblog.exitCode == 0
-      and joblog.cancelled == false and #joblog.lines == 1,
+      and joblog.cancelled == false and joblog.at ~= nil,
     tostring(joblog.kind) .. "/" .. tostring(joblog.ok))
 
-  -- The refresh button / the job-log event: the re-publish path must carry the display too.
+  -- The refresh button / the job-log event: the re-publish path carries the same reference.
   local before = H.published["restic_joblog"]
   onIpc("job-log")
   local refreshed = H.published["restic_joblog"]
-  local refreshedLine = type(refreshed) == "table" and type(refreshed.display) == "table"
-    and refreshed.display[1] or nil
-  check("a republish carries the formatted log",
-    refreshed ~= before and refreshedLine ~= nil and refreshedLine.kind == "backup"
-      and refreshedLine.filesUnmodified == 173 and refreshed.collapsed == 0,
-    refreshed and tostring(#(refreshed.display or {})))
+  check("a republish carries the same log reference",
+    refreshed ~= before and type(refreshed) == "table" and refreshed.kind == "backup"
+      and refreshed.logPath == paths.log,
+    refreshed and tostring(refreshed.logPath))
+  noLogBody("a republished job", refreshed)
+  fullLogPayload("a republished job", refreshed)
 
   -- initialise() republishes from the persisted path, so the Log tab survives a shell restart.
   restart({ interval_minutes = 1440, check_interval_hours = 0 })
   drain()
   local revived = H.published["restic_joblog"]
-  local revivedLine = type(revived) == "table" and type(revived.display) == "table"
-    and revived.display[1] or nil
-  check("a restart republishes the formatted log",
-    revivedLine ~= nil and #revived.display == 1 and revivedLine.kind == "backup"
-      and revivedLine.filesUnmodified == 173,
-    revived and tostring(#(revived.display or {})))
+  check("a restart republishes the log reference",
+    type(revived) == "table" and revived.kind == "backup" and revived.logPath == paths.log,
+    revived and tostring(revived.logPath))
+  noLogBody("a restarted service", revived)
+  fullLogPayload("a restarted service", revived)
 end
 
-print("== a running job's log is live and bounded")
+print("== a running job publishes a reference and reads no log at all")
 
 do
-  local progress = readFixture("backup-progress.jsonl")
   boot({ interval_minutes = 1440, check_interval_hours = 0 })
   drain()
   onIpc("backup-now")
   local _, paths = lastJob()
   check("the running job has a log path", paths ~= nil)
 
-  -- The runner appends as restic writes, so the panel has to follow it poll by poll.
+  -- The runner appends as restic writes, so the panel has to be told the log grew, poll by poll.
   H.files[paths.log] = "== post-backup command ==\n"
   update()
   local first = H.published["restic_joblog"]
-  check("the first bytes of a running job are published",
-    first ~= nil and #first.display == 1 and first.display[1].kind == "text"
-      and first.display[1].text == "== post-backup command ==",
-    first and tostring(#(first.display or {})))
+  check("the first bytes of a running job publish a live reference",
+    type(first) == "table" and first.logPath == paths.log, first and tostring(first.logPath))
   check("a run in flight is published as unfinished, not as a failure",
     first.kind == "backup" and first.ok == false and first.exitCode == nil,
     tostring(first.ok) .. "/" .. tostring(first.exitCode))
+  noLogBody("a running job", first)
 
   -- The live refresh is throttled: every republish re-renders the panel inside this service
   -- callback, and on a 97 KB listing job that tripped the host's per-callback CPU budget, so a
@@ -1419,15 +1473,15 @@ do
   check("a growth poll inside the live-refresh window publishes nothing",
     H.published["restic_joblog"] == first)
 
-  -- Past the window, and only for bytes appended after it, the display follows the log (the bytes
-  -- above were already accounted for by the skipped poll, so they are not "new" any more).
   H.nowMs = (NOW_SEC + 6) * 1000
   H.files[paths.log] = "== post-backup command ==\npruned 3 old dumps\nstill going\n"
   update()
   local second = H.published["restic_joblog"]
-  check("the display follows a growing log across polls",
-    second ~= first and #second.display == 3 and second.display[2].text == "pruned 3 old dumps",
-    second and tostring(#(second.display or {})))
+  check("past the window the payload follows the growing log",
+    second ~= first and type(second) == "table" and second.logPath == paths.log
+      and second.exitCode == nil,
+    second and tostring(second.logPath))
+  noLogBody("a refreshed running job", second)
 
   -- A tick that sees no new bytes must not publish: the panel re-renders on every state change.
   update()
@@ -1435,25 +1489,55 @@ do
   update()
   check("a second idle tick publishes nothing either", H.published["restic_joblog"] == second)
 
-  -- The last write carries the summary; the finished payload replaces the live one.
-  H.files[paths.log] = "== post-backup command ==\npruned 3 old dumps\n" .. progress
+  -- A payload's own weight: the longest string it holds anywhere. The fix's whole point is that this
+  -- does not grow with the log -- a 97 KB job used to publish ~200 lines plus the formatter's copy
+  -- (~104 KiB per tick, measured), which is what the host's per-callback CPU budget killed.
+  local function longestString(value, seen)
+    local longest = 0
+    seen = seen or {}
+    for _, item in pairs(value) do
+      if type(item) == "string" then
+        longest = math.max(longest, #item)
+      elseif type(item) == "table" and not seen[item] then
+        seen[item] = true
+        longest = math.max(longest, longestString(item, seen))
+      end
+    end
+    return longest
+  end
+
+  -- [0.4.0] The size that killed this tick live: a ~97 KB `ls --json` job log. The payload published
+  -- from the growth tick must not carry a byte of it.
+  H.nowMs = (NOW_SEC + 12) * 1000
+  H.files[paths.log] = string.rep(readFixture("ls-list.jsonl"), 7)
+  update()
+  local big = H.published["restic_joblog"]
+  check("a 97 KB job log publishes a payload that carries no part of it",
+    #H.files[paths.log] > 97000 and type(big) == "table" and big.logPath == paths.log
+      and longestString(big) <= #paths.log,
+    tostring(#H.files[paths.log]) .. " log bytes, longest published string "
+      .. tostring(type(big) == "table" and longestString(big) or "n/a"))
+  noLogBody("a 97 KB job log", big)
+
+  -- [0.4.0] THE FIX, proved the only way it can be: the log is deleted from the harness's file map,
+  -- so the service cannot read a single byte of it, and the tick must not need to -- it publishes
+  -- WHERE the log is and the panel reads the file itself. The job still finishes, and its payload
+  -- still carries the run's metadata and its path.
+  H.files[paths.log] = nil
+  update()
+  check("a tick with the log gone reads nothing and publishes nothing",
+    H.published["restic_joblog"] == big)
   H.files[paths.exit] = "0\n"
   update()
   local finished = H.published["restic_joblog"]
-  check("the finished job publishes the folded display",
-    finished ~= second and #finished.display == 4 and finished.collapsed == 2,
-    finished and tostring(#(finished.display or {})) .. "/" .. tostring(finished and finished.collapsed))
-  check("the progress line is the progress line",
-    type(finished.display) == "table" and #finished.display == 4
-      and finished.display[3] ~= nil and finished.display[3].kind == "progress"
-      and finished.display[3].percent == 84.25 and finished.display[3].filesDone == 3362,
-    finished.display[3] and tostring(finished.display[3].filesDone))
-  check("the summary closes the log",
-    type(finished.display) == "table" and finished.display[4] ~= nil
-      and finished.display[4].kind == "backup" and finished.display[4].filesNew == 4000,
-    finished.display[4] and finished.display[4].kind)
-  check("the finished payload reports the run's outcome",
-    finished.ok == true and finished.exitCode == 0, tostring(finished.ok))
+  check("a job whose log is gone still publishes its metadata and its path",
+    finished ~= big and type(finished) == "table" and finished.ok == true
+      and finished.exitCode == 0 and finished.logPath == paths.log,
+    finished and tostring(finished.logPath))
+  noLogBody("a finished job with its log gone", finished)
+  fullLogPayload("a finished job with its log gone", finished)
+  check("no read of the missing log raised anything",
+    logCount("restic ipc error") == 0, logCount("restic ipc error"))
 
   -- And with no job in flight, no tick touches the log ever again.
   update()

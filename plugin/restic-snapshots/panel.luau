@@ -24,6 +24,7 @@
 local restic = require("./lib/restic.luau")
 local schedule = require("./lib/schedule.luau")
 local state = require("./lib/state.luau")
+local logfmt = require("./lib/logfmt.luau")
 
 local SERVICE = "carlocamacho/restic-snapshots:service"
 
@@ -55,7 +56,7 @@ local ui_state = {
   -- view mode. Cleared with every other transient step (showTab / onOpen); `logRaw` is a view
   -- preference rather than a pending action, so a tab switch leaves it alone.
   openRow = nil,         -- { id = <snapshot id>, sheet = bool, details = bool }
-  logRaw = false,        -- Log tab: false = the typed display lines, true = the service's raw lines
+  logRaw = false,        -- Log tab: false = the formatter's typed lines, true = the log's raw lines
 }
 
 -- ── helpers ──────────────────────────────────────────────────────────────────
@@ -1516,13 +1517,118 @@ end
 --
 -- [0.4.0] The tab used to render the service's raw lines, each with maxLines = 1: every scheduled
 -- backup's log is a single 473-byte `--json` summary record, so the tab showed one clamped fragment
--- and nothing else (docs/CONTRACTS-0.4.0.md 1.1). It now renders the typed `display` lines the
--- service publishes (lib/logfmt.luau, frozen in 2.1) with the wording owned HERE -- the formatter
--- cannot call tr -- and keeps the raw lines behind a toggle for the record itself.
+-- and nothing else (docs/CONTRACTS-0.4.0.md 1.1). It renders the typed lines of lib/logfmt.luau
+-- (frozen in 2.1) with the wording owned HERE -- the formatter cannot call tr -- and keeps the raw
+-- lines behind a toggle for the record itself.
+--
+-- [0.4.0] The formatter runs HERE, over a log this panel reads itself, from the path the service
+-- publishes. The service used to format the log inside its `update()` tick and publish the text,
+-- and on a 97 KB `ls --json` job the allocation that caused killed that callback
+-- ("script callback 'update' exceeded its CPU budget"). The service now publishes
+-- { kind, at, ok, cancelled, exitCode, logPath } and this panel does the reading, the formatting and
+-- the caching (contracts 2.2/2.3/2.4).
 
 -- The formatter bounds its output; this bound keeps the panel's own work bounded too, because the
 -- tab re-renders on every state publish.
 local MAX_LOG_ROWS = 200
+
+-- How much of the log this panel reads. The host reads whole files only, so the bound is applied to
+-- what came back -- exactly like lib/jobs.luau's readLog: keep the last N bytes, then drop the
+-- partial first line the bound cut in half (half a line is not a line a viewer can show).
+local JOBLOG_TAIL_BYTES = 16384
+
+-- The cache. This tab re-renders on every state publish -- and the service republishes the log
+-- reference as a live run grows, which is how the view stays live -- so the file must be read at
+-- most once per change. (path, size, mtime) is the whole key: a log that has not changed cannot
+-- render differently, so a re-render with the same key reuses the lines already formatted.
+--
+-- An empty `lines` and `display` is the empty state's input: no path, no file, a file that is empty,
+-- or a host read that failed all mean "there is nothing to show", and the tab says so rather than
+-- rendering a broken view.
+local joblogView = {
+  path = nil, size = nil, mtime = nil,
+  lines = {}, display = {}, collapsed = 0, truncated = false,
+}
+
+-- The bounded, formatted job log. Never raises: the read and the format are both guarded here, next
+-- to the calls, because a log viewer that crashes on a log is worse than no viewer.
+local function readJobLog(path)
+  local size, mtime = nil, nil
+  local infoOk, info = pcall(noctalia.fileInfo, path)
+  if infoOk and type(info) == "table" then
+    size = tonumber(info.size)
+    mtime = tonumber(info.mtime)
+  end
+  if joblogView.path == path and joblogView.size == size and joblogView.mtime == mtime then
+    return joblogView
+  end
+
+  local view = {
+    path = path, size = size, mtime = mtime,
+    lines = {}, display = {}, collapsed = 0, truncated = false,
+  }
+  local readOk, text = pcall(noctalia.readFile, path)
+  if not readOk or type(text) ~= "string" then
+    text = ""
+  end
+  if #text > JOBLOG_TAIL_BYTES then
+    text = text:sub(-JOBLOG_TAIL_BYTES)
+    local newline = text:find("\n", 1, true)
+    if newline ~= nil then
+      text = text:sub(newline + 1)
+    end
+    view.truncated = true
+  end
+  if text ~= "" then
+    -- Raw is the same text split into lines, bounded to the LAST MAX_LOG_ROWS of them: one forward
+    -- pass over the newlines keeping the start of each of the last N lines (the same ring-buffer
+    -- bound lib/jobs.luau's tailLines uses), so the cost scales with the number of lines and never
+    -- with the byte count. The last N, not the first N, because that is the window the user wants
+    -- (the newest output) and the window the formatter's own output keeps -- Raw and Formatted must
+    -- never describe different parts of the run.
+    local starts = {}
+    local count = 0
+    local from = 1
+    local textLength = #text
+    while from <= textLength do
+      local newline = text:find("\n", from, true)
+      count = count + 1
+      starts[((count - 1) % MAX_LOG_ROWS) + 1] = from
+      if newline == nil then
+        break
+      end
+      from = newline + 1
+    end
+    local lines = {}
+    if count > 0 then
+      local first = count <= MAX_LOG_ROWS and 1 or (count - MAX_LOG_ROWS + 1)
+      for index = first, count do
+        local start = starts[((index - 1) % MAX_LOG_ROWS) + 1]
+        local newline = text:find("\n", start, true)
+        table.insert(lines, text:sub(start, newline ~= nil and newline - 1 or textLength))
+      end
+    end
+    if count > MAX_LOG_ROWS then
+      view.truncated = true
+    end
+    view.lines = lines
+    -- Formatted is the formatter's typed lines over the same bounded text, so the two views can
+    -- never describe different runs. A format that cannot run leaves Formatted empty and Raw still
+    -- shows the lines.
+    local formatOk, formatted = pcall(logfmt.format, text, { maxLines = MAX_LOG_ROWS })
+    if formatOk and type(formatted) == "table" then
+      if type(formatted.display) == "table" then
+        view.display = formatted.display
+      end
+      view.collapsed = tonumber(formatted.collapsed) or 0
+    end
+  end
+
+  joblogView.path, joblogView.size, joblogView.mtime = view.path, view.size, view.mtime
+  joblogView.lines, joblogView.display = view.lines, view.display
+  joblogView.collapsed, joblogView.truncated = view.collapsed, view.truncated
+  return joblogView
+end
 
 -- "?" is this panel's existing way of saying "the record does not carry this" (see the row meta and
 -- the file listing). A log line is not a details card: a missing count reads as unknown, not as the
@@ -1546,9 +1652,9 @@ local function logBytes(value)
 end
 
 -- restic's `percent_done` is a 0..1 fraction and this panel's own progress bar uses that scale, so a
--- fraction is rendered as a percentage. lib/logfmt.luau is another workstream's file and is not in
--- this worktree yet, so a value already expressed in percent is accepted as-is: of the two possible
--- readings this picks the one that cannot print 4200% for a job that is 42% done.
+-- fraction is rendered as a percentage. lib/logfmt.luau passes restic's own value through untouched,
+-- so a value already expressed in percent is accepted as-is: of the two possible readings this picks
+-- the one that cannot print 4200% for a job that is 42% done.
 local function logPercent(value)
   local percent = tonumber(value)
   if percent == nil then
@@ -1695,7 +1801,7 @@ local function logTab()
   if joblog.exitCode ~= nil then
     table.insert(headerParts, tr("panel.logs.exit", { code = tostring(joblog.exitCode) }))
   end
-  table.insert(children, ui.row({ gap = 8, align = "center" }, {
+  local headerRow = {
     ui.label({
       key = "joblog-header",
       text = table.concat(headerParts, " · "),
@@ -1703,20 +1809,55 @@ local function logTab()
       fontSize = 12,
       flexGrow = 1,
     }),
-    logModeButton(),
-    refresh,
-  }))
+  }
 
-  local lines = type(joblog.lines) == "table" and joblog.lines or {}
-  local display = type(joblog.display) == "table" and joblog.display or nil
+  -- The log itself: read from the path the payload names, bounded and formatted, through the cache.
+  -- A payload with no path yet, and a log that cannot be read, both leave `view` bodyless -- the
+  -- empty state below -- and neither is an error.
+  local view = nil
+  if type(joblog.logPath) == "string" and joblog.logPath ~= "" then
+    local ok, result = pcall(readJobLog, joblog.logPath)
+    if ok and type(result) == "table" then
+      view = result
+    end
+  end
+  local lines = view ~= nil and view.lines or {}
+  local display = view ~= nil and view.display or {}
+  local hasBody = #lines > 0 or #display > 0
+
+  -- The view toggle only exists when there are two views to toggle between.
+  if hasBody then
+    table.insert(headerRow, logModeButton())
+  end
+  table.insert(headerRow, refresh)
+  table.insert(children, ui.row({ gap = 8, align = "center" }, headerRow))
+
+  if not hasBody then
+    -- The existing empty state, plus its hint: a job that has not written its log yet -- or whose log
+    -- has been swept -- reads as "nothing to show", never as a broken panel.
+    table.insert(children, ui.label({
+      key = "joblog-empty",
+      text = tr("panel.empty.logs"),
+      color = "on_surface/0.6",
+      fontSize = 12,
+    }))
+    table.insert(children, ui.label({
+      key = "joblog-empty-hint",
+      text = tr("panel.empty.logs_hint"),
+      color = "on_surface/0.5",
+      fontSize = 11,
+    }))
+    return children
+  end
+
   local items = {}
   local shown = 0
   local cut = false
 
-  -- Raw is the pre-0.4.0 view: the service's own lines. Formatted renders the typed display lines;
-  -- a log published before the formatter existed carries no `display` at all, so Formatted falls
-  -- back to the lines rather than showing an empty tab.
-  if ui_state.logRaw or display == nil then
+  -- Raw is the pre-0.4.0 view: the log's own lines, unclamped. Formatted renders the typed lines;
+  -- a log the formatter could not turn into lines falls back to the raw ones rather than showing an
+  -- empty tab.
+  if ui_state.logRaw or #display == 0 then
     for _, line in ipairs(lines) do
       if shown >= MAX_LOG_ROWS then
         cut = true
@@ -1743,7 +1884,7 @@ local function logTab()
     -- The folded count describes the Formatted view only: it says how many progress/record lines
     -- were folded into the lines above. Raw shows those lines themselves, where the note would
     -- describe nothing.
-    local folded = tonumber(joblog.collapsed) or 0
+    local folded = tonumber(view ~= nil and view.collapsed) or 0
     if folded > 0 then
       table.insert(items, ui.label({
         key = "logs-folded",
@@ -1758,7 +1899,9 @@ local function logTab()
   end
   table.insert(children, ui.scroll({ key = "joblog", flexGrow = 1, gap = 2, padding = 6, stickToBottom = true }, items))
 
-  if joblog.truncated == true or cut then
+  -- Truncation is the panel's own measurement now: the file was bigger than the tail it read, or the
+  -- rendering bound cut rows. Either way the notice describes what THIS view left out.
+  if cut or (view ~= nil and view.truncated == true) then
     table.insert(children, ui.label({
       key = "joblog-truncated",
       text = tr("panel.logs.truncated", { lines = tostring(shown) }),
