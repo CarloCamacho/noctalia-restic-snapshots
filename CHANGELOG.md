@@ -28,6 +28,13 @@ plugin actually did — and two of them limitations of the shell that the plugin
   `exit 0`.
 - **A prune suggestion was described as a repair suggestion**, and a folded `ls`/`diff` stream was
   reported as "progress lines folded" whatever it actually contained.
+- **A large job log fell back to raw.** Formatting the log inside the service's periodic publish
+  exceeded the shell's per-callback CPU budget on a 97 KB listing job — the shell meters CPU time
+  and charges the GC work of a large allocation to the callback that caused it — so the Log tab
+  showed raw JSON for exactly the logs this release makes readable. The service now publishes the
+  log's **path**, and the panel reads, formats and caches it when you open the Log tab, so the
+  periodic callback carries no payload proportional to a file. Verified by four reproductions of that
+  job with no budget error, where it had previously failed on every run.
 
 ### Changed
 

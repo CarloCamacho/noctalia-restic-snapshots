@@ -199,3 +199,22 @@ already prepared). A and B share no file, so they can run at the same time.
 State: files changed, the exact commands you ran and their results, what you could **not** verify,
 and any decision the contract did not cover. Give a commit hash on your branch. Do not merge,
 rebase, or push.
+
+**What follows for the plugin.** A periodic callback must not carry a payload proportional to a file:
+the host meters CPU time, and the GC work a large allocation triggers on a live heap is charged to
+the callback that caused it. The rule this release learned is **publish a reference, not the data** -
+the service publishes where the log is, and the viewer, which runs only while a human is looking at
+it, does the reading, formatting and caching. Measured allocations, for the record:
+
+| work | allocated |
+|---|---|
+| formatting a 32 KiB tail | 34.9 KiB |
+| formatting a 16 KiB tail | 22.2 KiB |
+| building the 200-line raw table (the service, per publish) | 68.8 KiB |
+| building the 100-line raw table | 34.8 KiB |
+
+Two smaller lessons from the same hunt: the host's `os.clock()` is not a usable proxy for the budget
+(it reported 19 ms for work that measures 0.25 ms elsewhere), and the host's Luau sandbox has **no
+`collectgarbage`** - calling it raises `attempt to call a nil value` on every tick, which broke the
+plugin for four test runs before the diagnostic was removed. The test harness *does* have it, so such
+a diagnostic passes the gate and fails live.
