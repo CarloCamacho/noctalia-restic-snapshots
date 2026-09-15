@@ -430,6 +430,20 @@ local function scriptText()
   return paths ~= nil and (H.files[paths.script] or "") or ""
 end
 
+-- [0.4.0] The real restic 0.19.1 captures, read from disk: a job log is precisely the thing that
+-- must be tested against what restic writes, not against JSON someone typed by hand. The paths are
+-- relative to the repo root, which is where the gate runs this suite from.
+local function readFixture(name)
+  local handle = io.open("tests/fixtures/" .. name, "r")
+  if handle == nil then
+    check("fixture " .. name .. " is readable", false, "tests/fixtures/" .. name .. " is missing")
+    return ""
+  end
+  local text = handle:read("a")
+  handle:close()
+  return text
+end
+
 -- Finish the job in flight the way the runner does: the whole log, then the exit file.
 local function exitJob(logText, exitCode)
   local _, paths = lastJob()
@@ -1319,6 +1333,121 @@ do
   onIpc("stats")
   drain()
   check("stats without a repository publishes nothing", H.published["restic_stats"] == nil)
+end
+
+print("== a finished job publishes a readable log")
+
+do
+  -- The real 473-byte one-line log from this machine: it used to BE the Log tab.
+  local summary = readFixture("backup-summary.jsonl")
+  boot({ interval_minutes = 1440, check_interval_hours = 0 })
+  drain()
+  onIpc("backup-now")
+  local _, paths = lastJob()
+  check("the backup job started", paths ~= nil)
+  exitJob(summary, 0)
+
+  local joblog = H.published["restic_joblog"]
+  check("the finished job publishes a formatted log",
+    type(joblog) == "table" and type(joblog.display) == "table" and #joblog.display == 1,
+    joblog and tostring(#(joblog.display or {})))
+  local line = joblog.display[1]
+  check("the line is typed, not a JSON blob", line ~= nil and line.kind == "backup",
+    line and line.kind)
+  check("the numbers are restic's own",
+    line ~= nil and line.filesUnmodified == 173 and line.bytesProcessed == 860367
+      and math.abs(line.durationSeconds - 1.167760836) < 1e-9,
+    line and tostring(line.filesUnmodified))
+  check("a one-line log folds nothing", joblog.collapsed == 0, tostring(joblog.collapsed))
+  check("the raw lines are still published for the Raw view",
+    type(joblog.lines) == "table" and #joblog.lines == 1, tostring(#(joblog.lines or {})))
+  check("the other published fields are untouched",
+    joblog.kind == "backup" and joblog.ok == true and joblog.exitCode == 0
+      and joblog.cancelled == false and #joblog.lines == 1,
+    tostring(joblog.kind) .. "/" .. tostring(joblog.ok))
+
+  -- The refresh button / the job-log event: the re-publish path must carry the display too.
+  local before = H.published["restic_joblog"]
+  onIpc("job-log")
+  local refreshed = H.published["restic_joblog"]
+  local refreshedLine = type(refreshed) == "table" and type(refreshed.display) == "table"
+    and refreshed.display[1] or nil
+  check("a republish carries the formatted log",
+    refreshed ~= before and refreshedLine ~= nil and refreshedLine.kind == "backup"
+      and refreshedLine.filesUnmodified == 173 and refreshed.collapsed == 0,
+    refreshed and tostring(#(refreshed.display or {})))
+
+  -- initialise() republishes from the persisted path, so the Log tab survives a shell restart.
+  restart({ interval_minutes = 1440, check_interval_hours = 0 })
+  drain()
+  local revived = H.published["restic_joblog"]
+  local revivedLine = type(revived) == "table" and type(revived.display) == "table"
+    and revived.display[1] or nil
+  check("a restart republishes the formatted log",
+    revivedLine ~= nil and #revived.display == 1 and revivedLine.kind == "backup"
+      and revivedLine.filesUnmodified == 173,
+    revived and tostring(#(revived.display or {})))
+end
+
+print("== a running job's log is live and bounded")
+
+do
+  local progress = readFixture("backup-progress.jsonl")
+  boot({ interval_minutes = 1440, check_interval_hours = 0 })
+  drain()
+  onIpc("backup-now")
+  local _, paths = lastJob()
+  check("the running job has a log path", paths ~= nil)
+
+  -- The runner appends as restic writes, so the panel has to follow it poll by poll.
+  H.files[paths.log] = "== post-backup command ==\n"
+  update()
+  local first = H.published["restic_joblog"]
+  check("the first bytes of a running job are published",
+    first ~= nil and #first.display == 1 and first.display[1].kind == "text"
+      and first.display[1].text == "== post-backup command ==",
+    first and tostring(#(first.display or {})))
+  check("a run in flight is published as unfinished, not as a failure",
+    first.kind == "backup" and first.ok == false and first.exitCode == nil,
+    tostring(first.ok) .. "/" .. tostring(first.exitCode))
+
+  H.files[paths.log] = "== post-backup command ==\npruned 3 old dumps\n"
+  update()
+  local second = H.published["restic_joblog"]
+  check("the display follows a growing log across polls",
+    second ~= first and #second.display == 2 and second.display[2].text == "pruned 3 old dumps",
+    second and tostring(#(second.display or {})))
+
+  -- A tick that sees no new bytes must not publish: the panel re-renders on every state change.
+  update()
+  check("an idle tick publishes nothing", H.published["restic_joblog"] == second)
+  update()
+  check("a second idle tick publishes nothing either", H.published["restic_joblog"] == second)
+
+  -- The last write carries the summary; the finished payload replaces the live one.
+  H.files[paths.log] = "== post-backup command ==\npruned 3 old dumps\n" .. progress
+  H.files[paths.exit] = "0\n"
+  update()
+  local finished = H.published["restic_joblog"]
+  check("the finished job publishes the folded display",
+    finished ~= second and #finished.display == 4 and finished.collapsed == 2,
+    finished and tostring(#(finished.display or {})) .. "/" .. tostring(finished and finished.collapsed))
+  check("the progress line is the progress line",
+    type(finished.display) == "table" and #finished.display == 4
+      and finished.display[3] ~= nil and finished.display[3].kind == "progress"
+      and finished.display[3].percent == 84.25 and finished.display[3].filesDone == 3362,
+    finished.display[3] and tostring(finished.display[3].filesDone))
+  check("the summary closes the log",
+    type(finished.display) == "table" and finished.display[4] ~= nil
+      and finished.display[4].kind == "backup" and finished.display[4].filesNew == 4000,
+    finished.display[4] and finished.display[4].kind)
+  check("the finished payload reports the run's outcome",
+    finished.ok == true and finished.exitCode == 0, tostring(finished.ok))
+
+  -- And with no job in flight, no tick touches the log ever again.
+  update()
+  update()
+  check("no job active means no log publish", H.published["restic_joblog"] == finished)
 end
 
 print(string.format("\n%s -- %d failure(s)", failures == 0 and "ALL PASS" or "FAILURES", failures))

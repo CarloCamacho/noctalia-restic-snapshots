@@ -1,6 +1,42 @@
 # Changelog
 
-## 0.3.0 — unreleased
+## 0.4.0 — unreleased
+
+The readability release. Three things a user hit in the panel, all of them about seeing what the
+plugin actually did — and two of them limitations of the shell that the plugin had to work around.
+
+### Added
+
+- **A snapshot action sheet.** The trailing ⋯ button on a snapshot row opens *Details*, *Files*,
+  *Diff with previous*, *Restore*, *Copy id* and *Forget this snapshot* in a sheet inside the panel.
+  *Details* lists the snapshot's id, capture time (absolute and relative), host, tags, paths, files
+  processed, bytes processed and data added, and offers its file listing and a copy of the id.
+- **A Formatted / Raw log view.** See below.
+
+### Fixed
+
+- **The Log tab showed one clipped line of raw JSON.** It rendered restic's `--json` output
+  verbatim, one clamped line per record, so a routine hourly backup read as a single unreadable
+  blob (`{"message_type":"summary","files_new":0,…}`) and a listing job became 261 of them. The log
+  is now formatted for a human; *Raw* still shows the untouched stream.
+- **The ⋯ button did nothing on a left click.** The shell only permits its native context menu from
+  a pointer callback reached through `onRightClick`, and the button asked for it from `onClick`,
+  which returns false silently — so only a right click ever worked. A left click now opens the
+  in-panel sheet; the native menu is unchanged.
+- **An in-flight job's log read as "failed".** While a job runs, nothing has succeeded yet and there
+  is no exit code, so the header now says *running* and omits the exit code instead of inventing
+  `exit 0`.
+- **A prune suggestion was described as a repair suggestion**, and a folded `ls`/`diff` stream was
+  reported as "progress lines folded" whatever it actually contained.
+
+### Changed
+
+- **Where the panel opens is now a labelled setting.** `browser_placement` (*floating* — the
+  default, a centred window — or *attached* to the bar) and `browser_position`. The shell resolves
+  these from the plugin's settings, but injects them without a label when the plugin does not
+  declare them, which is why the option previously existed but could not be found.
+
+## 0.3.0 — 2026-09-14
 
 The proof release. 0.2.0 made the plugin honest about whether a backup *ran*; 0.3.0 makes it honest
 about whether that backup *restores*, and adds the three things that let it live in a machine you

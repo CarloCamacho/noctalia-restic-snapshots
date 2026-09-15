@@ -186,9 +186,15 @@ check("filter starts on all snapshots", select ~= nil and select.props.selectedI
 
 local dots = nodeByKey("menu-aaa111")
 check("dots button keyed by snapshot id exists", dots ~= nil)
-dots.props.onClick()
+-- [0.4.0] The LEFT click can never open the native menu: the host refuses panel.openContextMenu
+-- outside a live pointer context (src/scripting/plugin_bindings.cpp returns false) and the API doc
+-- names onRightClick as its only legal caller (docs/CONTRACTS-0.4.0.md 1.2). So the menu is
+-- asserted through the right click -- the one pointer context that works -- and the left click's
+-- in-panel sheet is asserted in its own section at the end of this file. This check used to read
+-- "dots click opens a context menu", which asserted the defect the contract removes.
+dots.props.onRightClick()
 local request = H.contextMenu
-check("dots click opens a context menu", request ~= nil)
+check("the dots button opens the native context menu", request ~= nil)
 check("context menu activates onContextAction", request ~= nil and request.onActivate == "onContextAction",
   request ~= nil and request.onActivate)
 check("context menu carries the snapshot id", request ~= nil and request.context == "aaa111")
@@ -831,6 +837,348 @@ clickTab("snapshots")
 text = H.text(H.tree)
 check("an empty repository shows the empty state", text:find("No snapshots yet", 1, true) ~= nil, text)
 check("an empty repository renders no rows", rowCount() == 0, tostring(rowCount()))
+
+-- ── [0.4.0] the snapshot action sheet (left click) ───────────────────────────
+-- The host refuses panel.openContextMenu outside a live pointer context
+-- (src/scripting/plugin_bindings.cpp) and the API doc names onRightClick as its only legal caller,
+-- so a left click on the dots can never open the native menu. It opens a sheet the PANEL renders,
+-- beneath the row. The right-click path is unchanged (asserted above).
+
+-- The same three rows as the fixture near the top of this file (the empty-state check emptied the
+-- list), rebuilt per call so one check can vary a single field without touching another.
+local function publishRows(mutate)
+  local rows = {
+    { id = "aaa111", shortId = "aaa11111", time = "2026-09-08T22:15:06+08:00", hostname = "host",
+      tags = { "noctalia" }, paths = { "/tmp/data" }, filesProcessed = 4, bytesProcessed = 2048 },
+    { id = "bbb222", shortId = "bbb22222", time = "2026-09-08T21:00:00+08:00", hostname = "nas",
+      tags = {}, paths = { "/srv" }, filesProcessed = 3, bytesProcessed = 1024 },
+    { id = "ccc333", shortId = "ccc33333", time = "2026-09-08T20:00:00+08:00", hostname = "host",
+      tags = { "noctalia", "weekly" }, paths = { "/etc" }, filesProcessed = 9, bytesProcessed = 4096 },
+  }
+  if mutate ~= nil then
+    mutate(rows)
+  end
+  publish("restic_snapshots", { schema = 2, updatedAt = 1788874602, snapshots = rows })
+  return rows
+end
+
+publishRows()
+clickTab("snapshots")
+check("the three snapshots are back for the sheet checks", rowCount() == 3, tostring(rowCount()))
+check("no sheet is open before the dots are clicked", nodeByKey("sheet-aaa111") == nil)
+
+-- The earlier context-menu checks leave a request in the harness slot: clear it, so the check below
+-- proves the LEFT click does not set one.
+H.contextMenu = nil
+nodeByKey("menu-aaa111").props.onClick()
+check("a left click on the dots opens the in-panel sheet", nodeByKey("sheet-aaa111") ~= nil)
+check("a left click never asks the host for the native menu it cannot open", H.contextMenu == nil,
+  tostring(H.contextMenu ~= nil))
+
+local SHEET_ACTIONS = { "details", "files", "diff_prev", "restore", "copy_id", "forget_one" }
+local missingEntries = {}
+for _, action in ipairs(SHEET_ACTIONS) do
+  if nodeByKey("sheet-" .. action .. "-aaa111") == nil then
+    table.insert(missingEntries, action)
+  end
+end
+check("the sheet offers every action", #missingEntries == 0, table.concat(missingEntries, ","))
+check("the sheet labels its entries from the catalogue keys",
+  nodeText("sheet-details-aaa111") == "Details"
+    and nodeText("sheet-files-aaa111") == "Files"
+    and nodeText("sheet-diff_prev-aaa111") == "Diff with previous"
+    and nodeText("sheet-restore-aaa111") == "Restore"
+    and nodeText("sheet-copy_id-aaa111") == "Copy snapshot id"
+    and nodeText("sheet-forget_one-aaa111") == "Forget this snapshot",
+  tostring(nodeText("sheet-details-aaa111")))
+
+local sheetRow = nodeByKey("entry-aaa111")
+check("the sheet renders beneath its own row",
+  sheetRow ~= nil and H.find(sheetRow, H.byKey("row-")) ~= nil
+    and H.find(sheetRow, H.byKey("sheet-")) ~= nil)
+check("another row carries no sheet",
+  nodeByKey("entry-bbb222") ~= nil and H.find(nodeByKey("entry-bbb222"), H.byKey("sheet-")) == nil)
+
+-- Per-row and predictable: one row is expanded at a time, and a second click on the same dots
+-- closes whatever that row had open.
+nodeByKey("menu-bbb222").props.onClick()
+check("opening another row's sheet closes the first",
+  nodeByKey("sheet-aaa111") == nil and nodeByKey("sheet-bbb222") ~= nil)
+nodeByKey("menu-bbb222").props.onClick()
+check("clicking the dots again closes the sheet", nodeByKey("sheet-bbb222") == nil)
+
+-- Every entry routes through the same code path the native menu uses.
+local beforeSheet = #H.commands
+nodeByKey("menu-aaa111").props.onClick()
+nodeByKey("sheet-files-aaa111").props.onClick()
+check("the Files entry asks for the listing and closes the sheet",
+  nodeByKey("sheet-aaa111") == nil and lastCommand():find("ls", 1, true) ~= nil
+    and lastCommand():find("aaa111", 1, true) ~= nil, lastCommand())
+check("the Files entry sent exactly one command", #H.commands == beforeSheet + 1, tostring(#H.commands - beforeSheet))
+
+nodeByKey("menu-aaa111").props.onClick()
+nodeByKey("sheet-diff_prev-aaa111").props.onClick()
+check("the Diff entry diffs against the older neighbour and closes the sheet",
+  nodeByKey("sheet-aaa111") == nil and lastCommand():find("diff", 1, true) ~= nil
+    and lastCommand():find("bbb222", 1, true) ~= nil, lastCommand())
+
+H.clipboard = nil
+nodeByKey("menu-aaa111").props.onClick()
+nodeByKey("sheet-copy_id-aaa111").props.onClick()
+check("the Copy id entry uses the clipboard and closes the sheet",
+  H.clipboard == "aaa111" and nodeByKey("sheet-aaa111") == nil, tostring(H.clipboard))
+
+-- Restore from the sheet still previews before it confirms: one click can never restore.
+publish("restic_job", nil)
+nodeByKey("menu-aaa111").props.onClick()
+nodeByKey("sheet-restore-aaa111").props.onClick()
+check("the Restore entry closes the sheet and opens the restore drawer",
+  nodeByKey("sheet-aaa111") == nil and nodeByKey("restore-draft") ~= nil)
+check("the Restore entry still has no confirm button before a preview",
+  nodeByKey("restore-confirm") == nil)
+nodeByKey("draft-dismiss").props.onClick()
+check("the restore drawer closes again", nodeByKey("restore-draft") == nil)
+
+check("an unknown action does not crash the panel", pcall(onContextAction, "not-an-action", "aaa111"))
+
+-- ── [0.4.0] Details: built from the row, nothing fetched ─────────────────────
+
+nodeByKey("menu-bbb222").props.onClick()
+nodeByKey("sheet-details-bbb222").props.onClick()
+check("the Details entry closes the sheet and opens the card",
+  nodeByKey("sheet-bbb222") == nil and nodeByKey("details-bbb222") ~= nil)
+check("the card titles itself from the catalogue key",
+  nodeText("details-title") == "Snapshot details", tostring(nodeText("details-title")))
+local cardText = H.text(nodeByKey("details-bbb222"))
+check("the card names its fields from the catalogue keys",
+  cardText:find("Snapshot ID", 1, true) ~= nil and cardText:find("Captured", 1, true) ~= nil
+    and cardText:find("Host", 1, true) ~= nil and cardText:find("Tags", 1, true) ~= nil
+    and cardText:find("Paths", 1, true) ~= nil and cardText:find("Files processed", 1, true) ~= nil
+    and cardText:find("Bytes processed", 1, true) ~= nil and cardText:find("Data added", 1, true) ~= nil,
+  cardText)
+check("the card renders the short and the full id",
+  nodeText("details-id-bbb222-value") == "bbb22222 · bbb222", tostring(nodeText("details-id-bbb222-value")))
+check("the card renders the capture time absolutely and relatively",
+  nodeText("details-captured-bbb222-value") == "2026-09-08T21:00:00+08:00 · 36m ago",
+  tostring(nodeText("details-captured-bbb222-value")))
+check("the card renders the row's host",
+  nodeText("details-host-bbb222-value") == "nas", tostring(nodeText("details-host-bbb222-value")))
+check("the card renders the row's paths",
+  nodeText("details-paths-bbb222-value") == "/srv", tostring(nodeText("details-paths-bbb222-value")))
+check("the card renders the row's real file and byte counts",
+  nodeText("details-files-bbb222-value") == "3" and nodeText("details-bytes-bbb222-value") == "1.0 KiB",
+  tostring(nodeText("details-files-bbb222-value")) .. " / " .. tostring(nodeText("details-bytes-bbb222-value")))
+-- A field the row does not carry: the catalogue's own wording, never a fabricated 0 and never "nil".
+check("a byte field the row does not carry renders panel.details.none",
+  nodeText("details-added-bbb222-value") == "not recorded", tostring(nodeText("details-added-bbb222-value")))
+check("an empty tag list renders panel.details.none",
+  nodeText("details-tags-bbb222-value") == "not recorded", tostring(nodeText("details-tags-bbb222-value")))
+check("the card never renders the string nil", cardText:find("nil", 1, true) == nil, cardText)
+
+-- A real 0 the row carries is a value and renders as one.
+publishRows(function(rows)
+  rows[1].filesProcessed = 0
+  rows[1].bytesProcessed = 0
+end)
+nodeByKey("menu-aaa111").props.onClick()
+nodeByKey("sheet-details-aaa111").props.onClick()
+check("a real zero the row carries renders as zero",
+  nodeText("details-files-aaa111-value") == "0" and nodeText("details-bytes-aaa111-value") == "0 B",
+  tostring(nodeText("details-files-aaa111-value")) .. " / " .. tostring(nodeText("details-bytes-aaa111-value")))
+check("a field the row lacks still renders panel.details.none",
+  nodeText("details-added-aaa111-value") == "not recorded", tostring(nodeText("details-added-aaa111-value")))
+check("the tags the row carries are listed",
+  nodeText("details-tags-aaa111-value") == "noctalia", tostring(nodeText("details-tags-aaa111-value")))
+
+-- The card's own buttons use the same code path as the menu and the sheet.
+beforeSheet = #H.commands
+nodeByKey("details-files-aaa111").props.onClick()
+check("the card's Files button asks for the listing",
+  lastCommand():find("ls", 1, true) ~= nil and lastCommand():find("aaa111", 1, true) ~= nil, lastCommand())
+check("the card stays open while its own buttons act", nodeByKey("details-aaa111") ~= nil)
+H.clipboard = nil
+nodeByKey("details-copy-aaa111").props.onClick()
+check("the card's Copy id button uses the clipboard", H.clipboard == "aaa111", tostring(H.clipboard))
+nodeByKey("details-dismiss-aaa111").props.onClick()
+check("the card closes again", nodeByKey("details-aaa111") == nil)
+
+-- ── [0.4.0] Delete from the sheet is the existing two-step flow ──────────────
+-- A single click must never forget a snapshot: the sheet's delete entry sets only the same draft the
+-- context menu sets, and the existing confirmation has to appear.
+
+publish("restic_job", nil)
+publishRows()
+clickTab("snapshots")
+nodeByKey("menu-ccc333").props.onClick()
+check("the delete entry is in the sheet", nodeByKey("sheet-forget_one-ccc333") ~= nil)
+local beforeDelete = #H.commands
+nodeByKey("sheet-forget_one-ccc333").props.onClick()
+check("the delete entry sends nothing on its own", #H.commands == beforeDelete,
+  tostring(#H.commands - beforeDelete))
+check("the delete entry opens the existing confirmation", nodeByKey("forget-confirm") ~= nil)
+check("the confirmation names the snapshot",
+  H.text(H.tree):find("Confirm: forget ccc333", 1, true) ~= nil, H.text(H.tree))
+check("the sheet closes when the delete entry runs", nodeByKey("sheet-ccc333") == nil)
+nodeByKey("forget-confirm").props.onClick()
+check("only the confirmation forgets the snapshot",
+  lastCommand():find("forget-one", 1, true) ~= nil and lastCommand():find("ccc333", 1, true) ~= nil,
+  lastCommand())
+
+-- A pending confirmation must still not survive a tab switch, and a tab switch closes the sheet.
+nodeByKey("menu-aaa111").props.onClick()
+clickTab("run")
+clickTab("snapshots")
+check("a tab switch closes the action sheet", nodeByKey("sheet-aaa111") == nil)
+
+-- ── [0.4.0] the Log tab: typed display lines, Formatted / Raw ───────────────
+-- 0.4.0 fixed the tab that showed one clamped JSON line. The service publishes typed `display` lines
+-- (lib/logfmt.luau, frozen in docs/CONTRACTS-0.4.0.md 2.1) and the panel owns the wording; Raw keeps
+-- the service's own lines behind the toggle, unclamped.
+
+local RAW_LINE = "{\"message_type\":\"summary\",\"files_new\":0,\"total_bytes_processed\":860367}"
+local JOB_DISPLAY = {
+  { kind = "text", text = "hook: pre-backup finished" },
+  { kind = "progress", percent = 0.42, filesDone = 12, totalFiles = 34, bytesDone = 1024, totalBytes = 2097152 },
+  { kind = "backup", filesNew = 3, filesChanged = 1, filesUnmodified = 30, dirsNew = 0, dirsChanged = 0,
+    dataAdded = 2048, bytesProcessed = 860367, durationSeconds = 1.2 },
+  { kind = "check", errors = 0, brokenPacks = 0, suggestRepair = false, suggestPrune = false },
+  { kind = "records", count = 40, source = "ls" },
+  { kind = "error", message = "repository is already locked", code = 1 },
+}
+
+local function publishLog(overrides)
+  local log = {
+    kind = "backup", at = 1788874500, ok = true, cancelled = false, exitCode = 0,
+    truncated = false, collapsed = 0, display = JOB_DISPLAY, lines = { RAW_LINE },
+  }
+  for key, value in pairs(overrides or {}) do
+    log[key] = value
+  end
+  publish("restic_joblog", log)
+  return log
+end
+
+-- Any label whose text is exactly this string, so a check can assert the rendered sentence itself.
+local function labelWith(value)
+  local hit = nil
+  for _, node in ipairs(H.findAll(H.tree, H.byType("label"))) do
+    if node.props.text == value then
+      hit = node
+    end
+  end
+  return hit
+end
+
+publishLog({ collapsed = 3 })
+clickTab("log")
+check("a text display line renders verbatim",
+  labelWith("hook: pre-backup finished") ~= nil)
+check("a progress display line renders the percent and the file counts",
+  labelWith("42% · 12/34 files · 1.0 KiB / 2.0 MiB") ~= nil
+    and H.text(H.tree):find("42%", 1, true) ~= nil
+    and H.text(H.tree):find("12/34", 1, true) ~= nil, H.text(H.tree))
+check("a backup display line renders its counts, bytes and duration",
+  labelWith("3 new · 1 changed · 30 unchanged · 840.2 KiB processed · 2.0 KiB added · 1.2s") ~= nil,
+  H.text(H.tree))
+check("a check display line renders its error count",
+  labelWith("0 errors") ~= nil)
+check("a records display line names the folded stream",
+  labelWith("40 records (ls)") ~= nil, H.text(H.tree))
+check("an error display line renders its message",
+  labelWith("error: repository is already locked") ~= nil)
+check("a passed check is not coloured as a problem",
+  labelWith("0 errors") ~= nil and labelWith("0 errors").props.color ~= "error")
+check("the folded note appears when lines were folded",
+  nodeText("logs-folded") == "3 lines folded", tostring(nodeText("logs-folded")))
+check("the Formatted view does not render the raw JSON record",
+  H.text(H.tree):find("message_type", 1, true) == nil, H.text(H.tree))
+
+-- A check that suggests a repair says so, and reads as a problem.
+publishLog({ display = {
+  { kind = "check", errors = 3, brokenPacks = 2, suggestRepair = true, suggestPrune = false },
+} })
+check("a check line with a suggested repair says so",
+  labelWith("3 errors · repair suggested") ~= nil, H.text(H.tree))
+check("a check line with errors is coloured as a problem",
+  labelWith("3 errors · repair suggested") ~= nil
+    and labelWith("3 errors · repair suggested").props.color == "error")
+
+-- The folded note is only for a real fold.
+publishLog({})
+check("no folded note when nothing was folded", nodeByKey("logs-folded") == nil)
+check("the mode button names the view that is on screen",
+  nodeText("logs-mode") == "Formatted", tostring(nodeText("logs-mode")))
+
+-- Raw: the service's own lines, unclamped, exactly as the tab used to show them (but readable).
+nodeByKey("logs-mode").props.onClick()
+check("the toggle switches to Raw", nodeText("logs-mode") == "Raw", tostring(nodeText("logs-mode")))
+check("Raw renders the service's own lines",
+  H.text(H.tree):find("message_type", 1, true) ~= nil, H.text(H.tree))
+check("Raw hides the formatted wording",
+  H.text(H.tree):find("42% · 12/34 files", 1, true) == nil, H.text(H.tree))
+local rawLabel = nil
+for _, node in ipairs(H.findAll(H.tree, H.byType("label"))) do
+  if node.props.text ~= nil and tostring(node.props.text):find("message_type", 1, true) ~= nil then
+    rawLabel = node
+  end
+end
+check("a raw line wraps instead of being clamped to one line",
+  rawLabel ~= nil and rawLabel.props.maxLines == nil,
+  rawLabel ~= nil and tostring(rawLabel.props.maxLines))
+check("the log still scrolls and still offers a refresh",
+  nodeByKey("joblog") ~= nil and nodeByKey("logs-refresh") ~= nil)
+
+nodeByKey("logs-mode").props.onClick()
+check("the toggle switches back to Formatted", nodeText("logs-mode") == "Formatted",
+  tostring(nodeText("logs-mode")))
+check("Formatted renders the translated lines again",
+  labelWith("42% · 12/34 files · 1.0 KiB / 2.0 MiB") ~= nil, H.text(H.tree))
+local hookLabel = labelWith("hook: pre-backup finished")
+check("a formatted text line wraps too", hookLabel ~= nil and hookLabel.props.maxLines == nil)
+
+-- An unknown kind must not crash a log viewer, and must not be given a sentence nobody translated.
+publishLog({ display = {
+  { kind = "text", text = "known line" },
+  { kind = "quantum", text = "an unknown kind" },
+  { kind = "quantum" },
+  42,
+} })
+check("the render survives an unknown display kind", nodeByKey("joblog") ~= nil)
+check("a known line still renders beside it", labelWith("known line") ~= nil, H.text(H.tree))
+check("an unknown kind shows the line's own text and invents nothing",
+  labelWith("an unknown kind") ~= nil
+    and H.text(H.tree):find("quantum", 1, true) == nil
+    and H.text(H.tree):find("panel.logs", 1, true) == nil, H.text(H.tree))
+
+-- A log published before the formatter existed carries no display: Formatted falls back to the raw
+-- lines rather than showing an empty tab (the pre-0.4.0 service shape, still exercised above).
+local legacyLog = publishLog({})
+legacyLog.display = nil
+publish("restic_joblog", legacyLog)
+check("Formatted falls back to the lines when no display was published",
+  H.text(H.tree):find("message_type", 1, true) ~= nil, H.text(H.tree))
+
+-- The panel bounds its own list too, and says so when it cuts: the formatter bounds its output, and
+-- this is the panel's own guard against an unbounded re-render (it renders on every publish).
+local manyLines = {}
+for index = 1, 300 do
+  manyLines[index] = "line " .. tostring(index)
+end
+publish("restic_joblog", {
+  kind = "backup", at = 1788874500, ok = true, cancelled = false, exitCode = 0,
+  truncated = false, collapsed = 0, lines = manyLines,
+})
+check("the panel's own log bound is honest about what it cut",
+  nodeText("joblog-truncated") == "log truncated to the last 200 lines",
+  tostring(nodeText("joblog-truncated")))
+check("the bound keeps the rows it left out off the tree",
+  H.text(H.tree):find("line 300", 1, true) == nil and H.text(H.tree):find("line 200", 1, true) ~= nil)
+
+publish("restic_joblog", nil)
+check("the log tab keeps its empty state",
+  nodeText("joblog-empty") == "No job log yet.", tostring(nodeText("joblog-empty")))
+check("the empty state still offers a refresh", nodeByKey("logs-refresh") ~= nil)
+check("no mode toggle before a log exists", nodeByKey("logs-mode") == nil)
 
 print(string.format("\n%s -- %d failure(s)", failures == 0 and "ALL PASS" or "FAILURES", failures))
 os.exit(failures == 0 and 0 or 1)

@@ -33,6 +33,7 @@ local schedule = require("./lib/schedule.luau")
 local state = require("./lib/state.luau")
 local store = require("./lib/store.luau")
 local metrics = require("./lib/metrics.luau")
+local logfmt = require("./lib/logfmt.luau")
 
 -- ── constants ────────────────────────────────────────────────────────────────
 
@@ -277,11 +278,11 @@ end
 -- ── job logs ─────────────────────────────────────────────────────────────────
 
 -- The tail of a job log as the panel's viewer wants it: a list of lines, bounded to 200 lines
--- and 32 KiB. jobs.readLog does the bounding; the file size is compared against what came back
--- so `truncated` is honest rather than assumed.
+-- and 32 KiB, plus the text they came from. jobs.readLog does the bounding; the file size is
+-- compared against what came back so `truncated` is honest rather than assumed.
 local function collectLogLines(path)
   if type(path) ~= "string" or path == "" then
-    return {}, false
+    return {}, false, ""
   end
   local text = jobs.readLog(path, LOG_TAIL_BYTES, LOG_TAIL_LINES)
   local lines = {}
@@ -296,11 +297,32 @@ local function collectLogLines(path)
       truncated = true
     end
   end
-  return lines, truncated
+  return lines, truncated, text
+end
+
+-- [0.4.0] restic's `--json` stream is one JSON object per line, so the Log tab used to show a
+-- clipped 473-byte blob. `lines` stays exactly what it was (the raw view); `display` is the same
+-- text as human lines, formatted by a pure module the panel can render without knowing restic.
+--
+-- The formatter is driven with the same tail text the raw view gets, so the two views can never
+-- describe different runs, and it may never take the panel down: a payload it cannot read is
+-- published as no display at all rather than as an error.
+local function formatLog(text)
+  if type(text) ~= "string" or text == "" then
+    return {}, 0
+  end
+  local ok, out = pcall(logfmt.format, text, { rawLines = LOG_TAIL_LINES })
+  if not ok or type(out) ~= "table" then
+    noctalia.log("restic: could not format the job log: " .. tostring(out))
+    return {}, 0
+  end
+  local display = type(out.display) == "table" and out.display or {}
+  return display, tonumber(out.collapsed) or 0
 end
 
 local function publishJobLog(meta, path)
-  local lines, truncated = collectLogLines(path)
+  local lines, truncated, text = collectLogLines(path)
+  local display, collapsed = formatLog(text)
   noctalia.state.set(state.KEY_JOBLOG, {
     kind = meta ~= nil and meta.kind or nil,
     at = meta ~= nil and meta.at or nil,
@@ -308,6 +330,8 @@ local function publishJobLog(meta, path)
     cancelled = meta ~= nil and meta.cancelled == true,
     exitCode = meta ~= nil and meta.exitCode or nil,
     lines = lines,
+    display = display,
+    collapsed = collapsed,
     truncated = truncated or (meta ~= nil and meta.truncated == true) or false,
   })
 end
@@ -838,8 +862,9 @@ finishJob = function(job, exitCode, text)
     exitCode = code,
     truncated = false,
   }
-  local lines, truncated = collectLogLines(job.logPath)
+  local lines, truncated, logTail = collectLogLines(job.logPath)
   meta.truncated = truncated
+  local display, collapsed = formatLog(logTail)
   noctalia.state.set(state.KEY_JOBLOG, {
     kind = kind,
     at = at,
@@ -847,6 +872,8 @@ finishJob = function(job, exitCode, text)
     cancelled = cancelled,
     exitCode = code,
     lines = lines,
+    display = display,
+    collapsed = collapsed,
     truncated = truncated,
   })
   lastJobMeta = meta
@@ -882,12 +909,38 @@ finishJob = function(job, exitCode, text)
   writeMetrics()
 end
 
+-- [0.4.0] The Log tab is live while a run is in flight. `publishJobLog` only knows about the
+-- persisted meta of a *finished* job, so a running one is published here instead, from the same
+-- bounded tail (LOG_TAIL_BYTES / LOG_TAIL_LINES) and only when the log has actually grown.
+--
+-- `ok` is false because the job has not succeeded yet, not because it failed: the panel already
+-- tells the two apart (a run in flight is the one with `status.job` set). `at` is when the run
+-- started, so the header's age is the run's age.
+local function publishRunningLog(job)
+  local lines, truncated, text = collectLogLines(job.logPath)
+  local display, collapsed = formatLog(text)
+  noctalia.state.set(state.KEY_JOBLOG, {
+    kind = job.kind,
+    at = job.startedAt,
+    ok = false,
+    cancelled = job.cancelRequested == true,
+    exitCode = nil,
+    lines = lines,
+    display = display,
+    collapsed = collapsed,
+    truncated = truncated,
+  })
+end
+
 local function pollJob()
   local job = activeJob
   if job == nil then
     return
   end
   local polled = jobs.poll(job.token, job.paths, job.lastSize)
+  -- The log grew since the last look: the only condition under which a running job re-publishes,
+  -- so an idle tick costs nothing and publishes nothing.
+  local grew = polled.size > (tonumber(job.lastSize) or 0)
   if polled.changed and polled.text ~= "" then
     job.lastSize = polled.size
   end
@@ -911,6 +964,12 @@ local function pollJob()
   if polled.done then
     finishJob(job, polled.exitCode, polled.text)
     return
+  end
+
+  -- The run is still in flight: refresh the Log tab from the log that just grew. Bounded by the
+  -- same tail limits as the finished path, and skipped entirely when nothing was appended.
+  if grew then
+    publishRunningLog(job)
   end
 
   -- Watchdog. Without it one hung restic blocked every future run forever (review finding #4).
