@@ -1,0 +1,4 @@
+== pre-backup command ==
+database dump written to /tmp/dump.sql
+== post-backup command ==
+pruned 3 old dumps
