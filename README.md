@@ -155,8 +155,14 @@ Typical workflows:
 
 - **Snapshots tab** — filter to *all snapshots* / *this host only* / *tagged &lt;tag&gt;*, type in the
   search box, flip newest/oldest. Each row's trailing `⋮` opens a context menu: *Preview restore*,
-  *Restore*, *Files*, *Diff vs previous*, *Copy id*, *Forget this snapshot*. Restore and forget both
-  preview first and ask for a second click; the id being acted on is always named.
+  *Restore*, *Files*, *Diff vs previous*, *Copy id*, *Forget this snapshot*.
+  The trailing **⋯ button** on each row opens the same actions as an in-panel sheet on a left click
+  — *Details*, *Files*, *Diff with previous*, *Restore*, *Copy id*, *Forget this snapshot* —
+  while a **right click** opens the shell's native menu. *Details* shows the snapshot's id (short
+  and full), when it was captured (absolute and relative), host, tags, paths, files processed, bytes
+  processed and data added, with buttons to open its file listing or copy the id.
+  Restore and forget both preview first and ask for a second click; the id being acted on is always
+  named, and **forget never happens from a single click**.
 - **Run tab** — *Back up now*, *Check repository*, *Verify restore*, and *Cancel* while a job is in
   flight. An *Initialise repository* button appears when the repository has never been created, and
   *Clear stale lock* when restic reports a lock. The repository stats card (total size, file count,
@@ -165,9 +171,22 @@ Typical workflows:
 - **Retention tab** — *Preview removal* runs `forget --dry-run --json` and shows the keep/remove
   counts plus the ids and times of the snapshots that would go. *Prune now* only appears afterwards,
   and still asks for a second confirmation.
-- **Log tab** — the last job's header (kind, when, verdict, exit code) and its output tail, with a
-  truncation notice when older lines were dropped and a Refresh button. Pre- and post-backup command
-  output appears here behind `== pre-backup command ==` / `== post-backup command ==`.
+- **Log tab** — the last job's header (kind, when, verdict, exit code; a job still running reads
+  *running* rather than failed) and its output, rendered **Formatted** for a human: progress is
+  folded into one line (`84.25% · 1006/4000 files · 63.6 MiB`), a backup's summary becomes a
+  sentence (`0 new · 0 changed · 173 unchanged · 840.2 KiB processed · 0 B added · 1.2s`), a listing
+  or diff stream is counted instead of printed (`40 records (ls)`), and the folded count is shown.
+  **Raw** switches to the untouched restic output, and a Refresh button re-reads it. Pre- and
+  post-backup command output appears here verbatim, behind `== pre-backup command ==` /
+  `== post-backup command ==`, as does any error — errors are never folded away, however long the
+  log is.
+
+### Where the panel opens
+
+The panel is a normal plugin panel, so the shell places it: **Settings → Plugins → Restic Snapshots
+→ Panel placement** chooses *floating* (the default — a centred window) or *attached* (docked to the
+bar the panel was opened from), and **Panel position** picks the corner or edge for a floating
+panel. Both are read when the panel opens, so a change takes effect the next time you open it.
 
 ## Restore verification
 
@@ -456,6 +475,8 @@ settings page's advanced toggle.
 | `verify_interval_hours` | `int` | `0` (0–720) | How often to prove a backup can actually be restored. `0` disables scheduled verification; the Run tab's *Verify restore* button and the `verify-restore` IPC event still work. |
 | `verify_file_count` | `int` | `3` (1–25) | How many files a verification restores and compares. A value below 1 falls back to the default (3); above 25 it is clamped to 25. |
 | `metrics_dir` | `folder` | *(empty)* | Directory for the Prometheus textfile export (`restic_snapshots.prom`). Empty means the plugin writes nothing at all. See [Prometheus textfile export](#prometheus-textfile-export). *Advanced.* |
+| `browser_placement` | `select` | `floating` | Where this plugin's panel opens: `floating` (a centred window) or `attached` (docked to the bar). Read by the shell when the panel opens. |
+| `browser_position` | `select` | `center` | Where a floating panel is placed: `auto`, `center`, or a corner/edge (`top_left` … `bottom_right`). Ignored while the panel is attached. |
 
 **Widget settings** are configured where the widget is added (**Settings → Bar**), not on the plugin
 page:
