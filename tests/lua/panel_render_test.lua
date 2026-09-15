@@ -832,6 +832,46 @@ H.config.keep_weekly = 4
 H.config.keep_monthly = 6
 render()
 
+-- ── the prune confirmation is reachable however long the list is ────────────
+-- The retention tab used to build one flat column: policy, preview button, counts, note, list title,
+-- up to MAX_REMOVE_ROWS rows, then the prune button. The panel is 820x620 and its root column does
+-- NOT scroll -- every other tab bounds its own body in a ui.scroll, and this one did not -- so a
+-- long removal list pushed the prune button, the confirmation for an irreversible action, off the
+-- bottom edge with nothing to scroll. Reported from a real panel: 16 to remove, 12 rows visible, no
+-- button.
+--
+-- The test asserts the STRUCTURE, not a pixel: the rows live inside a scroll, and the button is not
+-- inside it. If the button ever moves back inside the scrolling region, a long list can hide it
+-- again and this fails.
+
+local longRemove = {}
+for index = 1, 20 do
+  table.insert(longRemove, {
+    id = string.format("rm%05d", index),
+    shortId = string.format("rm%05d", index):sub(1, 8),
+    time = "2026-09-08T10:00:00+08:00",
+  })
+end
+clickTab("retention")
+publish("restic_job", {
+  kind = "forget-dry", at = 1788874602, ok = true,
+  keepCount = 9, removeCount = #longRemove, remove = longRemove, truncated = false,
+})
+
+local removalScroll = nodeByKey("removal-scroll")
+check("a full removal list renders inside a scroll, so it can be read to the end",
+  removalScroll ~= nil)
+check("the scroll holds the removal rows",
+  removalScroll ~= nil and H.find(removalScroll, H.byKey("remove-")) ~= nil)
+check("the prune button is OUTSIDE the scroll, so no list length can hide it",
+  removalScroll ~= nil and H.find(removalScroll, H.byKey("prune")) == nil)
+check("the prune button still renders with the list at its maximum",
+  nodeByKey("prune") ~= nil)
+check("the note and the confirmation it points at are both present",
+  nodeByKey("preview-note") ~= nil and nodeByKey("prune") ~= nil)
+-- The button comes after the scroll in the body, so the confirmation sits below the list it describes.
+check("the counts stay visible above the list", nodeByKey("preview-counts") ~= nil)
+
 -- ── empty states ─────────────────────────────────────────────────────────────
 
 H.stateValues["restic_status"].lastRun = nil

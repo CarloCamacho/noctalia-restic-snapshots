@@ -1663,18 +1663,28 @@ local function retentionTab()
       color = "on_surface/0.7",
       fontSize = 12,
     }))
+    -- [0.6.1] The list scrolls; the confirmation does not.
+    --
+    -- This tab used to build one flat column, and the panel's root column does not scroll -- the
+    -- snapshots and log tabs each bound their own body in a ui.scroll and this one did not. So the
+    -- rows grew past the panel's fixed 820x620, took the truncation notice and the prune button with
+    -- them, and the button is the confirmation for an IRREVERSIBLE action: the note above says
+    -- "confirm below" and there was no way to reach below. The list takes the height that is left
+    -- and the button is appended after it, so no list length can push the confirmation out of reach.
+    local rows = {}
     local shown = 0
     for _, entry in ipairs(remove) do
       if shown >= MAX_REMOVE_ROWS then
         break
       end
       shown = shown + 1
-      table.insert(children, ui.row({ key = "remove-" .. tostring(entry.id), gap = 8, align = "center" }, {
+      table.insert(rows, ui.row({ key = "remove-" .. tostring(entry.id), gap = 8, align = "center" }, {
         ui.label({ text = tostring(entry.shortId or entry.id or "?"), fontSize = 11 }),
         ui.spacer({ flexGrow = 1 }),
         ui.label({ text = tostring(entry.time or "?"), color = "on_surface/0.5", fontSize = 11 }),
       }))
     end
+    table.insert(children, ui.scroll({ key = "removal-scroll", flexGrow = 1, gap = 2 }, rows))
     if job.truncated == true or #remove > shown then
       table.insert(children, ui.label({
         key = "preview-remove-truncated",
