@@ -9,6 +9,9 @@
 -- verification that failed -- or that compared nothing and so proved nothing -- gets a short label in
 -- the bar next to the staleness readout, because a hover is not a notification.
 
+-- [0.5.0] The bar also carries the shape of the repository: a sparkline of the bytes each recent
+-- snapshot added, beside the glyph. It is the one fact a glance can carry that a tooltip cannot.
+
 local restic = require("./lib/restic.luau")
 local schedule = require("./lib/schedule.luau")
 local state = require("./lib/state.luau")
@@ -165,11 +168,87 @@ local function verifyHint()
   return nil
 end
 
+-- ── history sparkline (0.5.0) ────────────────────────────────────────────────
+-- The bytes each of the last few snapshots added, oldest to newest. A bar widget is a glance, and
+-- the thing worth glancing at is the shape of the repository over time: a cluster of full bars is
+-- an afternoon of real work, and a long flat run is hours of backups that correctly stored nothing.
+local SPARK_POINTS = 20
+-- A bar never reaches zero height. With frequent backups most values are legitimately zero, and a
+-- graph whose honest reading is "flat along the bottom" is indistinguishable from a broken one, so
+-- the floor holds the flat case up where it can be seen and read as flat.
+local SPARK_FLOOR = 0.15
+
+local history = {}
+
+-- The status payload carries counts, not per-snapshot history, so this reads the snapshots list.
+-- Sorted by the timestamp string, which is ISO 8601 and so sorts chronologically as text.
+local function recentAdded(value)
+  local rows = type(value) == "table" and value.snapshots or nil
+  if type(rows) ~= "table" then
+    return {}
+  end
+  local ordered = {}
+  for _, row in ipairs(rows) do
+    if type(row) == "table" then
+      table.insert(ordered, row)
+    end
+  end
+  if #ordered < 2 then
+    return {}
+  end
+  table.sort(ordered, function(left, right)
+    return tostring(left.time or "") < tostring(right.time or "")
+  end)
+  local series = {}
+  local start = #ordered - SPARK_POINTS + 1
+  if start < 1 then
+    start = 1
+  end
+  for index = start, #ordered do
+    table.insert(series, math.max(0, tonumber(ordered[index].dataAdded) or 0))
+  end
+  return series
+end
+
+local function sparkValues()
+  if #history < 2 then
+    return nil
+  end
+  local top = 0
+  for _, value in ipairs(history) do
+    if value > top then
+      top = value
+    end
+  end
+  local out = {}
+  for _, value in ipairs(history) do
+    local normalised = SPARK_FLOOR
+    if top > 0 then
+      normalised = SPARK_FLOOR + (1 - SPARK_FLOOR) * (value / top)
+    end
+    table.insert(out, normalised)
+  end
+  return out
+end
+
 local function render()
   local colour = colourFor()
   local children = {
     ui.glyph({ name = glyphFor(), size = 15, color = colour }),
   }
+
+  local spark = sparkValues()
+  if spark ~= nil then
+    table.insert(children, ui.graph({
+      key = "history-spark",
+      values = spark,
+      color = colour,
+      height = 14,
+      width = 46,
+      lineWidth = 1,
+      fillOpacity = 0.15,
+    }))
+  end
 
   if noctalia.getConfig("show_count") == true then
     table.insert(children, ui.label({ text = tostring(status.snapshotCount or 0), color = colour }))
@@ -254,6 +333,11 @@ end
 
 noctalia.state.watch(state.KEY_STATUS, function(value)
   status = state.migrate(value)
+  render()
+end)
+
+noctalia.state.watch(state.KEY_SNAPSHOTS, function(value)
+  history = recentAdded(value)
   render()
 end)
 

@@ -350,5 +350,71 @@ H.stateValues["restic_status"].repoConfigured = false
 update()
 check("tile disables without a repository", H.shortcutEnabled == false)
 
+-- ── history sparkline (0.5.0) ────────────────────────────────────────────────
+-- The bar carries the repository's shape beside the glyph. It reads the snapshots list rather than
+-- the status payload, so before any snapshot history is published there is nothing to draw and the
+-- widget must render exactly as it did -- which every check above this line has already proved.
+
+local function publishSnapshots(snapshots)
+  local value = { schema = 2, updatedAt = 1788874602, snapshots = snapshots }
+  H.stateValues["restic_snapshots"] = value
+  local watch = H.stateValues["__watch_restic_snapshots"]
+  if watch ~= nil then
+    watch(value)
+  end
+  update()
+end
+
+-- The shortcut tile loaded above owns the global update() from here on, and it left the status
+-- unconfigured, so the widget's tree is stale. Publishing an empty history forces a fresh render of
+-- the widget -- through its own state watch -- so the glyph comparison at the end of this block is
+-- between two renders of the same status rather than between a fresh one and a stale one.
+H.stateValues["restic_status"].available = true
+H.stateValues["restic_status"].repoConfigured = true
+publishSnapshots({})
+
+check("no sparkline while no snapshot history exists", H.find(H.tree, H.byType("graph")) == nil)
+local glyphBefore = glyph() ~= nil and glyph().props.name or nil
+check("a usable widget with no history leads with the archive glyph", glyphBefore == "archive",
+  tostring(glyphBefore))
+
+publishSnapshots({
+  { id = "a", time = "2026-09-08T20:00:00+08:00", dataAdded = 0 },
+  { id = "b", time = "2026-09-08T21:00:00+08:00", dataAdded = 0 },
+  { id = "c", time = "2026-09-08T22:00:00+08:00", dataAdded = 4096 },
+})
+local spark = H.find(H.tree, H.byType("graph"))
+check("a sparkline appears once snapshot history exists", spark ~= nil)
+check("the sparkline has one point per snapshot",
+  spark ~= nil and #spark.props.values == 3, spark ~= nil and tostring(#spark.props.values) or "no graph")
+check("the point for the snapshot that added data is the tallest",
+  spark ~= nil and spark.props.values[3] > spark.props.values[1],
+  spark ~= nil and (tostring(spark.props.values[3]) .. " vs " .. tostring(spark.props.values[1])) or "no graph")
+-- An honest reading of an idle repository is "flat", and a line pinned along the floor is
+-- indistinguishable from a graph that failed to draw. The floor is what keeps those apart.
+check("no point sits at zero, so a flat repository reads as flat and not as broken",
+  spark ~= nil and spark.props.values[1] > 0, spark ~= nil and tostring(spark.props.values[1]) or "no graph")
+check("no point exceeds the box", spark ~= nil and spark.props.values[3] <= 1,
+  spark ~= nil and tostring(spark.props.values[3]) or "no graph")
+check("the sparkline does not disturb the glyph",
+  spark ~= nil and glyph() ~= nil and glyph().props.name == glyphBefore,
+  tostring(glyphBefore) .. " -> " .. tostring(glyph() ~= nil and glyph().props.name))
+
+-- The list arrives newest-first in places and oldest-first in others: the series must be built from
+-- the timestamps, not from the array order, or the shape reads backwards.
+publishSnapshots({
+  { id = "c", time = "2026-09-08T22:00:00+08:00", dataAdded = 4096 },
+  { id = "a", time = "2026-09-08T20:00:00+08:00", dataAdded = 0 },
+  { id = "b", time = "2026-09-08T21:00:00+08:00", dataAdded = 0 },
+})
+local reversed = H.find(H.tree, H.byType("graph"))
+check("the series is ordered by time, whatever order the rows arrive in",
+  reversed ~= nil and reversed.props.values[3] > reversed.props.values[1],
+  reversed ~= nil and (tostring(reversed.props.values[3]) .. " vs " .. tostring(reversed.props.values[1]))
+    or "no graph")
+
+publishSnapshots({})
+check("the sparkline goes away when the history does", H.find(H.tree, H.byType("graph")) == nil)
+
 print(string.format("\n%s -- %d failure(s)", failures == 0 and "ALL PASS" or "FAILURES", failures))
 os.exit(failures == 0 and 0 or 1)
