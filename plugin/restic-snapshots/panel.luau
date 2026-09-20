@@ -199,20 +199,11 @@ end
 
 -- A total order: a row with an unreadable time sorts as the oldest rather than making the
 -- comparator inconsistent (Lua's table.sort may raise on an inconsistent order function).
+-- Ordering is lib/restic's job: it parses each row once and memoises the parse. Doing it here with a
+-- comparator that parsed both sides on every comparison is what grew this panel's cost with the
+-- repository's age until the host disabled it for exceeding its CPU budget.
 local function sortedRows(list, mode)
-  local copy = {}
-  for index, row in ipairs(list) do
-    copy[index] = row
-  end
-  table.sort(copy, function(a, b)
-    local left = restic.epochFromRfc3339(a.time) or 0
-    local right = restic.epochFromRfc3339(b.time) or 0
-    if mode == "oldest" then
-      return left < right
-    end
-    return left > right
-  end)
-  return copy
+  return restic.sortedByTime(list, mode)
 end
 
 local function visibleRows()

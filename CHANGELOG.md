@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.6.4 — 2026-09-20
+
+### Fixed
+
+- **The panel was disabled by the shell, reporting that it was not responding.** Ordering snapshots by
+  time parsed **both** timestamps on every comparison, and `table.sort` calls its comparator about
+  `N·log₂N` times — so this machine's repository, 127 snapshots with one added every hour, cost roughly
+  **1,800 timestamp parses** per panel open. Parsing is pattern matching and pattern matching
+  allocates, and the host charges the GC that a callback triggers to the callback itself: one open
+  exceeded the shell's per-callback CPU budget and the shell disabled the panel. Toggling the plugin
+  could not help, because the repository only grows. The same comparator was in the launcher, on the
+  path exercised by every search.
+
+  `lib/restic` now memoises the parse — it is pure, so caching by timestamp string is safe — and
+  exposes `restic.sortedByTime`, which parses each row **once**, sorts the decorated rows, and returns
+  them in order. Comparisons parse nothing, and re-ordering an unchanged list parses nothing at all.
+  The panel and the launcher both go through it, so the cost of opening a panel is now proportional to
+  the snapshots that are *new*, not to how long the repository has existed.
+
+  This was invisible to the behavioural tests, because the rows came out in the right order the whole
+  time. A 200-row sort measured **3,684 parses** before the fix and **200** after it, so the new checks
+  assert the cost (`restic.epochParseStats`) as well as the order.
+
+- **Ordering by time is now one total order shared by every surface.** The launcher's comparator and
+  the panel's had identical semantics but separate implementations; both now delegate, so a future
+  change to "oldest" or to unreadable timestamps cannot apply to one and not the other.
+
+
 ## 0.6.3 — 2026-09-15
 
 ### Fixed

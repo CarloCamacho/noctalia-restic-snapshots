@@ -753,7 +753,7 @@ end
 -- interprets a table in the local zone) is deliberately avoided: it would be wrong on a box whose
 -- TZ differs from the snapshot offset. A timestamp without an offset is refused rather than
 -- guessed. Sub-second digits are floored: staleness is compared in whole seconds.
-function M.epochFromRfc3339(value)
+local function parseRfc3339(value)
   if type(value) ~= "string" then
     return nil
   end
@@ -787,6 +787,86 @@ function M.epochFromRfc3339(value)
     return nil
   end
   return daysFromCivil(year, month, day) * 86400 + hour * 3600 + minute * 60 + second - offset
+end
+
+-- ── ordering snapshots by time, without parsing inside a comparator ──────────────────────────────
+--
+-- Parsing a timestamp is a few pattern matches, and pattern matches allocate. A sort that parses both
+-- of its operands on every comparison therefore costs 2*N*log2(N) parses plus a pile of garbage --
+-- and the host runs every callback under a CPU budget, charging the GC that this triggers to the
+-- callback that caused it. That is precisely how this plugin's panel came to be disabled with "not
+-- responding": at 127 snapshots, one panel open re-parsed timestamps about 1,800 times, and the count
+-- grows by a snapshot an hour forever, so re-enabling the plugin changed nothing.
+--
+-- Parsing is pure, so memoising it by the timestamp string is safe; the memo is bounded because the
+-- timestamps come from restic's output rather than from us. `false` stands in for "not parseable",
+-- because a Lua table cannot hold nil.
+local epochMemo = {}
+local epochMemoCount = 0
+local EPOCH_MEMO_MAX = 4096
+local epochParseCount = 0
+
+function M.epochFromRfc3339(value)
+  if type(value) ~= "string" then
+    return nil
+  end
+  local hit = epochMemo[value]
+  if hit ~= nil then
+    if hit == false then
+      return nil
+    end
+    return hit
+  end
+  local parsed = parseRfc3339(value)
+  if epochMemoCount >= EPOCH_MEMO_MAX then
+    epochMemo = {}
+    epochMemoCount = 0
+  end
+  if parsed == nil then
+    epochMemo[value] = false
+    epochMemoCount = epochMemoCount + 1
+    return nil
+  end
+  epochMemo[value] = parsed
+  epochMemoCount = epochMemoCount + 1
+  epochParseCount = epochParseCount + 1
+  return parsed
+end
+
+-- How many timestamps were really parsed, and how many are memoised. This exists so the cost of
+-- ordering can be asserted rather than assumed: the regression this fixes was invisible to every
+-- behavioural test, because the rows came out in the right order either way.
+function M.epochParseStats()
+  return { parsed = epochParseCount, memoised = epochMemoCount }
+end
+
+-- Rows ordered by their timestamp, newest first, or oldest first with order = "oldest". Each row is
+-- parsed once here; the comparator only compares numbers. A row whose time cannot be read sorts as
+-- the oldest, which keeps the order total (table.sort may raise on an inconsistent comparator).
+function M.sortedByTime(rows, order)
+  if type(rows) ~= "table" then
+    return {}
+  end
+  local decorated = {}
+  local count = 0
+  for _, row in ipairs(rows) do
+    if type(row) == "table" then
+      count = count + 1
+      decorated[count] = { row = row, at = M.epochFromRfc3339(row.time) or 0 }
+    end
+  end
+  local oldestFirst = order == "oldest"
+  table.sort(decorated, function(a, b)
+    if oldestFirst then
+      return a.at < b.at
+    end
+    return a.at > b.at
+  end)
+  local ordered = {}
+  for position, entry in ipairs(decorated) do
+    ordered[position] = entry.row
+  end
+  return ordered
 end
 
 -- The single source of truth for "how old is the newest snapshot", so the service, the panel and

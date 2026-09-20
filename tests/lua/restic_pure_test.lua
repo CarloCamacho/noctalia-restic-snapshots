@@ -725,5 +725,73 @@ check("summariseForgetDry: a wrapped array is still bounded like a bare one",
   restic.summariseForgetDry(wrapped, 2).removeCount == 4
     and #restic.summariseForgetDry(wrapped, 2).remove == 2)
 
+-- ── ordering snapshots by time: the right order, at a bounded cost ───────────────────────────────
+--
+-- The panel and the launcher both order rows by their timestamp, and the host runs every callback
+-- under a CPU budget. Ordering used to parse BOTH timestamps on every comparison: table.sort calls
+-- its comparator about N*log2(N) times, so a repository of 127 snapshots -- this machine's, growing by
+-- one every hour -- cost roughly 1,800 pattern matches per panel open. The GC that caused was charged
+-- to the callback, which exceeded its budget, and the shell disabled the panel ("not responding").
+-- Re-enabling it changed nothing because the repository only grows. The rows came out in the right
+-- order the whole time, so no behavioural check could see it: the checks below assert the cost.
+
+-- Text order and chronological order genuinely disagree here, which is why this cannot be a string
+-- sort: 10:00Z is EARLIER than 13:20:43Z, but "10" sorts before "21" as text and after it in time.
+local LATER = { id = "b", time = "2026-09-14T21:20:43+08:00" }   -- 13:20:43Z, epoch 1789392043
+local EARLIER = { id = "a", time = "2026-09-14T10:00:00Z" }       -- epoch 1789380000
+
+local orderedNewest = restic.sortedByTime({ EARLIER, LATER }, "newest")
+check("sortedByTime: newest first, by parsed instant rather than by text",
+  #orderedNewest == 2 and orderedNewest[1].id == "b" and orderedNewest[2].id == "a",
+  orderedNewest[1] and orderedNewest[1].id or "nil")
+local orderedOldest = restic.sortedByTime({ LATER, EARLIER }, "oldest")
+check("sortedByTime: oldest first reverses the same order",
+  #orderedOldest == 2 and orderedOldest[1].id == "a" and orderedOldest[2].id == "b",
+  orderedOldest[1] and orderedOldest[1].id or "nil")
+check("sortedByTime: the input list is not reordered in place",
+  EARLIER.id == "a" and LATER.id == "b")
+
+-- A row whose time cannot be read sorts as the oldest, in both directions, so the order stays total.
+local broken = { id = "c" }
+local nilTime = { id = "d", time = nil }
+local garbage = { id = "e", time = "not a time" }
+local mixture = restic.sortedByTime({ broken, LATER, nilTime, EARLIER, garbage }, "newest")
+check("sortedByTime: an unreadable time sorts oldest, whatever it is",
+  #mixture == 5 and mixture[1].id == "b" and mixture[2].id == "a"
+    and (mixture[3].id == "c" or mixture[3].id == "d" or mixture[3].id == "e"),
+  tostring(mixture[1].id) .. "/" .. tostring(mixture[2].id))
+local oldestMixture = restic.sortedByTime({ broken, LATER, nilTime, EARLIER, garbage }, "oldest")
+check("sortedByTime: oldest first puts the unreadable times first",
+  oldestMixture[#oldestMixture].id == "b" and oldestMixture[#oldestMixture - 1].id == "a",
+  tostring(oldestMixture[#oldestMixture].id))
+check("sortedByTime: a missing list is an empty list, never an error",
+  #restic.sortedByTime(nil, "newest") == 0 and #restic.sortedByTime({}, "newest") == 0)
+
+-- 200 rows with distinct instants: one parse each, and a second sort parses nothing at all.
+local many = {}
+for index = 1, 200 do
+  many[index] = {
+    id = string.format("%064x", index),
+    time = string.format("2026-09-14T%02d:%02d:%02d+08:00",
+      10 + math.floor(index / 3600), math.floor(index / 60) % 60, index % 60),
+  }
+end
+local beforeFirst = restic.epochParseStats().parsed
+local sortedOnce = restic.sortedByTime(many, "newest")
+local afterFirst = restic.epochParseStats().parsed
+local sortedTwice = restic.sortedByTime(many, "newest")
+local afterSecond = restic.epochParseStats().parsed
+check("sortedByTime: one parse per row, never two per comparison (200 rows)",
+  (afterFirst - beforeFirst) <= 200,
+  string.format("parsed %d times (a per-comparison parse would be about %d)",
+    afterFirst - beforeFirst, 200 * 8 * 2))
+check("sortedByTime: re-sorting an unchanged list parses nothing (the memo)",
+  afterSecond == afterFirst,
+  string.format("%d parses on the second sort", afterSecond - afterFirst))
+check("sortedByTime: both sorts agree, and the order really is newest first",
+  #sortedOnce == 200 and #sortedTwice == 200 and sortedOnce[1].id == sortedTwice[1].id
+    and sortedOnce[1].time == "2026-09-14T10:03:20+08:00",
+  sortedOnce[1] and sortedOnce[1].time or "nil")
+
 print(string.format("\n%s -- %d failure(s)", failures == 0 and "ALL PASS" or "FAILURES", failures))
 os.exit(failures == 0 and 0 or 1)

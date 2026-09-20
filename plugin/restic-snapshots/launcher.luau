@@ -107,11 +107,9 @@ local function allRows()
     end
   end
   -- An unreadable time sorts as the oldest, which keeps the order total: table.sort may raise on an
-  -- inconsistent comparator. Same reasoning (and same shape) as lib/restic's sorted rows.
-  table.sort(rows, function(a, b)
-    return (restic.epochFromRfc3339(a.time) or 0) > (restic.epochFromRfc3339(b.time) or 0)
-  end)
-  return rows
+  -- inconsistent comparator. Shared with the panel (lib/restic parses each row once and memoises it,
+  -- rather than parsing both sides of every comparison).
+  return restic.sortedByTime(rows, "newest")
 end
 
 -- The snapshot's own instant as local clock time. "%H:%M" is the strftime-compatible token style

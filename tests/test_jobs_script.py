@@ -490,9 +490,10 @@ class JobScriptHooksTest(JobScriptHarness):
         """Contract 5.3: with neither option set the script carries no hook code.
 
         [0.3.0] It is no longer byte-identical to the pre-hooks generator, because cancellation now
-        needs the script's own pid and a trap in *every* job - hook-free jobs included. The
-        guarantee is kept, and sharpened: the only difference is those lines, in a known place, and
-        nothing else in the script may move.
+        needs the script's own pid and a trap in *every* job - hook-free jobs included. [0.6.0] added
+        one more documented line, the `unchanged` verbose-record filter. The guarantee is kept, and
+        sharpened: the only differences are those named lines, and with them removed the script must
+        still match the pre-hooks generator byte for byte.
         """
         baseline = subprocess.run(
             ["git", "-C", REPO_ROOT, "show", BASE_REV + ":" + PLUGIN_DIR + "/lib/jobs.luau"],
@@ -520,16 +521,37 @@ class JobScriptHooksTest(JobScriptHarness):
 
         old_lines = normalized(old)
         new_lines = normalized(new)
-        added = len(self.CANCELLATION_LINE_PATTERNS)
-        self.assertEqual(
-            len(new_lines), len(old_lines) + added,
-            "the cancellation lines are the only new lines",
-        )
+
+        # [0.3.0] The cancellation block, inserted directly after the umask, in this order.
         anchor = old_lines.index("umask 077") + 1
+        added = len(self.CANCELLATION_LINE_PATTERNS)
         self.assertEqual(new_lines[:anchor], old_lines[:anchor], "nothing before the umask moved")
-        self.assertEqual(new_lines[anchor + added:], old_lines[anchor:], "nothing after them moved")
         for line, pattern in zip(new_lines[anchor:anchor + added], self.CANCELLATION_LINE_PATTERNS):
             self.assertRegex(line, pattern)
+
+        # [0.6.0] The `unchanged` verbose-record filter, one `case` arm inside the JSONL splitter,
+        # which keeps a quiet hourly run's log to a handful of lines (261 of 262 records on a no-op
+        # backup are `unchanged`). It is a documented change to the script body like the cancellation
+        # lines above, so it is named here - exactly once, and directly above the catch-all that
+        # appends to the log.
+        unchanged = [
+            index
+            for index, line in enumerate(new_lines)
+            # The arm ends the shell pattern with a `*` before the `)`: *'"action":"unchanged"'*) : ;;
+            if "unchanged" in line and line.rstrip().endswith(") : ;;")
+
+        ]
+        self.assertEqual(len(unchanged), 1, "exactly one unchanged-record filter arm")
+        self.assertIn("*) printf", new_lines[unchanged[0] + 1], "it sits above the catch-all arm")
+
+        # With the two documented additions removed, nothing else in the script may differ.
+        del new_lines[anchor:anchor + added]
+        # The cancellation block sits above the case arm, so removing it shifts the arm's index.
+        del new_lines[unchanged[0] - added]
+        self.assertEqual(
+            new_lines, old_lines,
+            "apart from the documented cancellation and unchanged lines the script is unchanged",
+        )
         # And no hook machinery came along with them.
         for artefact in ("PRECOMMAND", "POSTCOMMAND", "RESTIC_EXIT", "/bin/sh -c"):
             self.assertNotIn(artefact, new["script_text"])
