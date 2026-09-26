@@ -6,6 +6,12 @@
 
 local M = {}
 
+local templates = require("./templates.luau")
+
+-- The sentinel id meaning "no template": `backup_paths` are the whole source set and none are
+-- treated as optional. Exported so the service can branch on it without a bare string.
+M.TEMPLATE_CUSTOM = templates.CUSTOM
+
 -- ── quoting ──────────────────────────────────────────────────────────────────
 
 function M.shellQuote(value)
@@ -246,12 +252,53 @@ function M.config(settings)
   if jobTimeout <= 0 then
     jobTimeout = 180
   end
+  -- [0.7.0] Backup sources. A built-in template supplies a curated set; any explicit
+  -- `backup_paths` are ADDITIONS on top of it, never replacements, so switching (or later
+  -- clearing) a template cannot silently drop a path the user typed. Every entry is `~`-expanded
+  -- and de-duplicated: `restic backup` runs from an argv with no shell, so a literal `~` would be
+  -- reported as "does not exist, skipping" and the source would never be backed up. Order is
+  -- preserved -- template paths first, then the user's additions -- so the snapshot's own path
+  -- list reads the way the setting does. An unknown template id degrades to `custom`, i.e. to
+  -- `backup_paths` alone, rather than to an empty source set.
+  local descriptor = templates.get(trim(settings.template))
+  local templateId = descriptor ~= nil and descriptor.id or templates.CUSTOM
+  local templatePaths = {}
+  local userPaths = {}
+  local seen = {}
+  local function addSource(list, raw)
+    local value = expandPath(raw)
+    if value ~= "" and seen[value] == nil then
+      seen[value] = true
+      table.insert(list, value)
+    end
+  end
+  if descriptor ~= nil then
+    for _, path in ipairs(descriptor.paths) do
+      addSource(templatePaths, path)
+    end
+  end
+  for _, path in ipairs(asList(settings.backup_paths)) do
+    addSource(userPaths, path)
+  end
+  -- The effective list is template-first so a snapshot's own path list reads the way the setting
+  -- does. `templatePaths` is kept separate because the two halves fail differently: a template
+  -- path is OPTIONAL (a machine may not have it, and the service drops the missing ones), while a
+  -- path the user typed is expected to exist and stays strict.
+  local sources = {}
+  for _, path in ipairs(templatePaths) do
+    table.insert(sources, path)
+  end
+  for _, path in ipairs(userPaths) do
+    table.insert(sources, path)
+  end
   return {
     bin = trim(settings.restic_bin) ~= "" and trim(settings.restic_bin) or "restic",
     repository = repository,
     redactedRepository = M.redactRepository(repository),
     passwordFile = trim(settings.password_file),
-    paths = asList(settings.backup_paths),
+    template = templateId,
+    templatePaths = templatePaths,
+    paths = sources,
     tags = asList(settings.backup_tags),
     excludeFile = trim(settings.exclude_file),
     mode = trim(settings.mode) ~= "" and trim(settings.mode) or "plugin",

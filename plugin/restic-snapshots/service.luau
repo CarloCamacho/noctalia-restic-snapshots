@@ -649,6 +649,32 @@ startJob = function(kind, argv, request, buildErr)
   return true, nil
 end
 
+-- [0.7.0] The sources a backup should actually hand to restic. A template names paths a given
+-- machine may not have (~/.zshrc, ~/.config/hyprfm, ...), and restic exits 3 -- "some source data
+-- could not be read" -- when a source is missing, which finishJob records as a FAILED run. That
+-- would make a template's optional paths turn every scheduled backup red. Template paths are
+-- therefore optional: the missing ones are dropped. A path the user typed in backup_paths is NOT
+-- optional -- a typo there should fail loudly, exactly as it did before templates existed.
+local function backupSources()
+  if cfg.template == restic.TEMPLATE_CUSTOM then
+    return cfg.paths, 0
+  end
+  local fromTemplate = {}
+  for _, path in ipairs(cfg.templatePaths) do
+    fromTemplate[path] = true
+  end
+  local kept = {}
+  local skipped = 0
+  for _, path in ipairs(cfg.paths) do
+    if fromTemplate[path] == true and noctalia.fileInfo(path) == nil then
+      skipped = skipped + 1
+    else
+      table.insert(kept, path)
+    end
+  end
+  return kept, skipped
+end
+
 triggerBackup = function()
   if cfg.mode ~= "plugin" then
     noctalia.log("restic: refusing backup - plugin is in observe mode")
@@ -658,7 +684,22 @@ triggerBackup = function()
     noctalia.log("restic: refusing backup - no backup paths configured")
     return false, "no backup paths configured"
   end
-  return startJob("backup", restic.backupArgs(cfg, resticPath))
+  local sources, skipped = backupSources()
+  if #sources == 0 then
+    noctalia.log("restic: refusing backup - no source in template '" .. tostring(cfg.template) .. " exists")
+    return false, "no source in the selected template exists"
+  end
+  local jobCfg = cfg
+  if skipped > 0 then
+    noctalia.log("restic: template '" .. tostring(cfg.template) .. "' skipped "
+      .. tostring(skipped) .. " missing source(s)")
+    jobCfg = {}
+    for key, value in pairs(cfg) do
+      jobCfg[key] = value
+    end
+    jobCfg.paths = sources
+  end
+  return startJob("backup", restic.backupArgs(jobCfg, resticPath))
 end
 
 -- What happens when a job stops, whatever stopped it: the outcome record, the per-kind payload,
@@ -1039,6 +1080,7 @@ local function loadConfig()
     restic_bin = get("restic_bin"),
     repository = get("repository"),
     password_file = get("password_file"),
+    template = get("template"),
     backup_paths = get("backup_paths"),
     backup_tags = get("backup_tags"),
     exclude_file = get("exclude_file"),

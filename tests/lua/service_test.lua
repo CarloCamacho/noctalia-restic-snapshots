@@ -844,6 +844,57 @@ do
   exitJob('{"message_type":"summary","total_files_processed":1}\n', 0)
 end
 
+print("== templates make their sources optional")
+
+do
+  -- A template names paths a machine may not have. Handing restic a missing source still creates
+  -- the snapshot but exits 3 ("some source data could not be read"), which finishJob records as a
+  -- FAILED run -- so a template's optional paths must be dropped before restic sees them, while a
+  -- path the user typed stays strict.
+  boot({ interval_minutes = 1440, template = "cachyos-system-restore",
+    backup_paths = { "~/cachyos-dotfiles" } })
+  H.missingPaths["/home/tester/.config/hyprfm"] = true
+  H.missingPaths["/home/tester/.zshrc"] = true
+  drain()
+  onIpc("backup-now")
+  local script = scriptText()
+  check("a missing template source is not passed to restic",
+    script:find("/home/tester/.config/hyprfm", 1, true) == nil, script)
+  check("another missing template source is dropped too",
+    script:find("/home/tester/.zshrc", 1, true) == nil)
+  check("an existing template source is still passed",
+    script:find("/home/tester/.config/hypr", 1, true) ~= nil)
+  check("an explicit backup path is kept under a template",
+    script:find("/home/tester/cachyos-dotfiles", 1, true) ~= nil)
+  check("the dropped sources are logged, not silent",
+    logCount("skipped 2 missing source") == 1, table.concat(H.logs, " | "))
+  exitJob('{"message_type":"summary","total_files_processed":1}\n', 0)
+
+  -- Under `custom`, nothing is optional: a typo must still reach restic and fail loudly.
+  boot({ interval_minutes = 1440, template = "custom", backup_paths = { "/tmp/typo" } })
+  H.missingPaths["/tmp/typo"] = true
+  drain()
+  onIpc("backup-now")
+  check("a missing explicit path under custom is still passed to restic",
+    scriptText():find("/tmp/typo", 1, true) ~= nil, scriptText())
+  exitJob('{"message_type":"summary","total_files_processed":1}\n', 0)
+
+  -- A template with nothing present is refused with a reason, not handed to restic as an empty
+  -- source set (which restic rejects with its own error).
+  boot({ interval_minutes = 1440, template = "cachyos-system-restore", backup_paths = {} })
+  local resticLib = H.load("lib/restic.luau")
+  local templatePaths = resticLib.config({ template = "cachyos-system-restore" }).templatePaths
+  for _, path in ipairs(templatePaths) do
+    H.missingPaths[path] = true
+  end
+  drain()
+  local before = jobStarts()
+  onIpc("backup-now")
+  check("a template with no existing source starts no job", jobStarts() == before)
+  check("a template with no existing source says why",
+    logCount("no source in template") == 1, table.concat(H.logs, " | "))
+end
+
 print("== a failing pre-command is reported honestly")
 
 do

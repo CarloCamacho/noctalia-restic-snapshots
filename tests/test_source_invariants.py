@@ -21,6 +21,7 @@ import json
 import os
 import pathlib
 import re
+import tomllib
 import unittest
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
@@ -110,6 +111,47 @@ class TestGlyphNames(unittest.TestCase):
     def test_glyph_inventory_is_not_empty(self):
         """Guards the extractor itself: a regex that matches nothing would make the check vacuous."""
         self.assertGreaterEqual(len(used_glyphs()), 8, "glyph extraction found suspiciously few names")
+
+
+class TestBackupTemplates(unittest.TestCase):
+    """The template library, the manifest's select and en.json must name the same templates.
+
+    A template added to lib/templates.luau but not offered in plugin.toml is unreachable; one
+    offered but not translated shows a raw key in Settings. The three are separate files, so
+    nothing but a test keeps them in step.
+    """
+
+    def template_ids(self):
+        source = (PLUGIN / "lib" / "templates.luau").read_text(encoding="utf-8")
+        return re.findall(r'^\s*id\s*=\s*"([a-z0-9-]+)"', source, re.M)
+
+    def manifest_template_options(self):
+        manifest = tomllib.loads((PLUGIN / "plugin.toml").read_text(encoding="utf-8"))
+        for setting in manifest.get("setting", []):
+            if setting.get("key") == "template":
+                return [option["value"] for option in setting.get("options", [])]
+        raise AssertionError("plugin.toml has no `template` setting")
+
+    def translations(self):
+        return json.loads((PLUGIN / "translations" / "en.json").read_text(encoding="utf-8"))
+
+    def test_manifest_offers_exactly_the_library_templates(self):
+        ids = self.template_ids()
+        self.assertTrue(ids, "no templates found in lib/templates.luau")
+        options = self.manifest_template_options()
+        self.assertIn("custom", options, "the select must offer the custom sentinel")
+        self.assertEqual(sorted(set(options) - {"custom"}), sorted(set(ids)))
+
+    def test_every_template_and_setting_has_a_translation(self):
+        catalogue = self.translations()
+        for template in self.template_ids():
+            for suffix in ("name", "description"):
+                key = f"templates.{template.replace('-', '_')}.{suffix}"
+                self.assertIn(key, catalogue, key)
+        for key in ("settings.template.label", "settings.template.description",
+                    "settings.template.custom", "panel.sources.label",
+                    "panel.sources.template_count", "panel.sources.custom_count"):
+            self.assertIn(key, catalogue, key)
 
 
 if __name__ == "__main__":

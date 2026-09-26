@@ -469,7 +469,7 @@ for _, case in ipairs(outcomeCases) do
 end
 
 -- config shape: every frozen key, with its value
-local frozen = { "bin", "repository", "redactedRepository", "passwordFile", "paths", "tags",
+local frozen = { "bin", "repository", "redactedRepository", "passwordFile", "template", "templatePaths", "paths", "tags",
   "excludeFile", "mode", "intervalMinutes", "keepLast", "keepDaily", "keepWeekly", "keepMonthly",
   "restoreTarget", "restoreAllowRoots", "checkSubset", "checkIntervalHours", "staleAfterHours",
   "jobTimeoutMinutes", "envFile", "verifyIntervalHours", "verifyFileCount" }
@@ -1023,8 +1023,13 @@ class TestLibrarySource(unittest.TestCase):
         return body
 
     def test_no_process_or_file_io(self):
+        # lib/templates.luau (0.7.0) is the ONE module lib/restic.luau may require: it is pure data
+        # with no host surface and no I/O of its own, so the pure layer stays testable outside
+        # Noctalia. Every other require, and every process/file call, stays forbidden.
+        source = self.source.replace('local templates = require("./templates.luau")', "")
         for forbidden in ("os.execute", "io.popen", "io.open", "loadfile", "dofile", "require("):
-            self.assertNotIn(forbidden, self.source, forbidden)
+            self.assertNotIn(forbidden, source, forbidden)
+        self.assertIn('local templates = require("./templates.luau")', self.source)
 
     def test_quoting_helpers_are_exported_for_jobs_luau(self):
         self.assertIn("function M.shellQuote", self.source)

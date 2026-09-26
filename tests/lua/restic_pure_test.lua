@@ -273,7 +273,45 @@ check("config: hostile repository is redacted in the display copy",
   restic.config(settings({ repository = "sftp://ian:secret@host:/repo" })).redactedRepository
     == "sftp://***@host:/repo")
 
-local frozenKeys = { "bin", "repository", "redactedRepository", "passwordFile", "paths", "tags",
+-- [0.7.0] Backup templates. A template supplies a curated source set; explicit backup_paths are
+-- added on top. Every source is `~`-expanded (restic runs from an argv, so a literal `~` would be
+-- reported missing) and de-duplicated.
+check("config: no template means custom", cfg.template == "custom", cfg.template)
+check("config: custom sources are backup_paths in order",
+  #cfg.paths == 2 and cfg.paths[1] == "/home/tester/docs" and cfg.paths[2] == "/etc",
+  table.concat(cfg.paths, ","))
+check("config: a ~ in backup_paths is expanded",
+  restic.config(settings({ backup_paths = { "~/docs" } })).paths[1] == "/home/tester/docs",
+  table.concat(restic.config(settings({ backup_paths = { "~/docs" } })).paths, ","))
+
+local templated = restic.config(settings({
+  template = "cachyos-system-restore",
+  backup_paths = { "~/extra", "~/.config/hypr" },
+}))
+check("config: the active template id is reported",
+  templated.template == "cachyos-system-restore", templated.template)
+check("config: template paths come first",
+  templated.paths[1] == "/home/tester/.config/hypr", templated.paths[1])
+check("config: explicit paths are added after the template",
+  templated.paths[#templated.paths] == "/home/tester/extra",
+  table.concat(templated.paths, ","))
+check("config: templatePaths carries only the template half",
+  #templated.templatePaths == 19 and templated.templatePaths[1] == "/home/tester/.config/hypr",
+  table.concat(templated.templatePaths, ","))
+local hyprCount = 0
+for _, path in ipairs(templated.paths) do
+  if path == "/home/tester/.config/hypr" then
+    hyprCount = hyprCount + 1
+  end
+end
+check("config: a path in both the template and backup_paths is not repeated", hyprCount == 1, hyprCount)
+
+local unknown = restic.config(settings({ template = "does-not-exist" }))
+check("config: an unknown template degrades to custom", unknown.template == "custom", unknown.template)
+check("config: an unknown template keeps backup_paths",
+  #unknown.paths == 2, table.concat(unknown.paths, ","))
+
+local frozenKeys = { "bin", "repository", "redactedRepository", "passwordFile", "template", "templatePaths", "paths", "tags",
   "excludeFile", "mode", "intervalMinutes", "keepLast", "keepDaily", "keepWeekly", "keepMonthly",
   "restoreTarget", "restoreAllowRoots", "checkSubset", "checkIntervalHours", "staleAfterHours",
   "jobTimeoutMinutes", "envFile" }

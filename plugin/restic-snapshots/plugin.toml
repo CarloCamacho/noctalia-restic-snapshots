@@ -42,6 +42,17 @@ description_key = "settings.env_file.description"
 default         = ""
 
 [[setting]]
+key             = "template"
+type            = "select"
+label_key       = "settings.template.label"
+description_key = "settings.template.description"
+default         = "custom"
+options = [
+  { value = "custom",                  label_key = "settings.template.custom" },
+  { value = "cachyos-system-restore", label_key = "templates.cachyos_system_restore.name" },
+]
+
+[[setting]]
 key             = "backup_paths"
 type            = "string_list"
 label_key       = "settings.backup_paths.label"

@@ -401,6 +401,30 @@ H.config.backup_paths = { "/tmp/data" }
 render()
 check("a configured plugin offers an enabled backup button", nodeByKey("backup").props.enabled == true)
 
+-- [0.7.0] The active template and the sources it resolves to are visible on the Run tab, so the
+-- user can confirm what a named template captures without opening a snapshot.
+H.config.template = "cachyos-system-restore"
+H.config.backup_paths = { "~/extra" }
+render()
+text = H.text(H.tree)
+check("a template is named on the run tab",
+  text:find("CachyOS System Restore", 1, true) ~= nil, text)
+check("the source count covers the template and the additions",
+  text:find("19 paths from the template", 1, true) ~= nil, text)
+check("a template source is shown expanded",
+  text:find("/home/tester/.config/hypr", 1, true) ~= nil, text)
+check("an explicit path is shown expanded",
+  text:find("/home/tester/extra", 1, true) ~= nil, text)
+check("the source preview is width-bounded",
+  nodeByKey("sources-paths").props.flexGrow == 1 and nodeByKey("sources-paths").props.maxLines == 1)
+H.config.template = "custom"
+H.config.backup_paths = { "/tmp/data" }
+render()
+check("custom names the backup paths",
+  H.text(H.tree):find("Custom (backup paths only)", 1, true) ~= nil, H.text(H.tree))
+check("custom counts only backup paths",
+  H.text(H.tree):find("1 paths from backup paths", 1, true) ~= nil, H.text(H.tree))
+
 -- Initialise and stale lock.
 H.stateValues["restic_status"].initNeeded = true
 render()

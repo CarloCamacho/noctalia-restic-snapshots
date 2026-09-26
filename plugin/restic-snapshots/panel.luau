@@ -25,6 +25,7 @@ local restic = require("./lib/restic.luau")
 local schedule = require("./lib/schedule.luau")
 local state = require("./lib/state.luau")
 local logfmt = require("./lib/logfmt.luau")
+local templates = require("./lib/templates.luau")
 
 local SERVICE = "carlocamacho/restic-snapshots:service"
 
@@ -90,6 +91,7 @@ local function settings()
     repository = noctalia.getConfig("repository"),
     password_file = noctalia.getConfig("password_file"),
     env_file = noctalia.getConfig("env_file"),
+    template = noctalia.getConfig("template"),
     backup_paths = noctalia.getConfig("backup_paths"),
     backup_tags = noctalia.getConfig("backup_tags"),
     exclude_file = noctalia.getConfig("exclude_file"),
@@ -1272,6 +1274,46 @@ local function statRow(key, labelKey, value)
   })
 end
 
+-- [0.7.0] What the active template (plus any explicit paths) actually captures. The Run tab has no
+-- scroll of its own, so this card is compact by construction: the source list is joined into ONE
+-- label that fills the row and clamps at the panel edge, never one row per path. A snapshot's own
+-- Details card still lists every path in full, because restic records them per snapshot.
+local function sourcesCard(cfg)
+  if #cfg.paths == 0 then
+    return nil
+  end
+  local descriptor = templates.get(cfg.template)
+  local name = descriptor ~= nil and tr(descriptor.name_key) or tr("settings.template.custom")
+  local countKey = descriptor ~= nil and "panel.sources.template_count" or "panel.sources.custom_count"
+  -- The template's own count, not the effective total: the joined list below shows the additions
+  -- as well, so "19 paths from the template" stays true no matter what backup_paths add.
+  local count = descriptor ~= nil and #cfg.templatePaths or #cfg.paths
+  return ui.column({ key = "sources-card", gap = 4, padding = 10 }, {
+    ui.row({ gap = 8, align = "center" }, {
+      ui.glyph({ name = "folder", size = 13, color = "primary" }),
+      ui.label({ text = tr("panel.sources.label"), fontWeight = "bold", fontSize = 12 }),
+      ui.spacer({ flexGrow = 1 }),
+      ui.label({ key = "sources-template", text = name, color = "on_surface/0.6", fontSize = 12 }),
+    }),
+    ui.label({
+      key = "sources-count",
+      text = tr(countKey, { count = tostring(count) }),
+      color = "on_surface/0.6",
+      fontSize = 11,
+    }),
+    -- `flexGrow` is what bounds this: a label takes its natural width unless something makes it
+    -- fill the row, and a joined path list has no break opportunity that `maxLines` alone clamps.
+    ui.label({
+      key = "sources-paths",
+      text = table.concat(cfg.paths, " · "),
+      color = "on_surface/0.5",
+      fontSize = 11,
+      flexGrow = 1,
+      maxLines = 1,
+    }),
+  })
+end
+
 local function statsCard()
   if type(stats) ~= "table" then
     -- Never render zeros for a card that was never fetched; the refresh button below is how the
@@ -1594,6 +1636,11 @@ local function runTab()
     color = "on_surface/0.5",
     fontSize = 12,
   }))
+
+  local sources = sourcesCard(cfg)
+  if sources ~= nil then
+    table.insert(children, sources)
+  end
 
   local card = statsCard()
   if card ~= nil then

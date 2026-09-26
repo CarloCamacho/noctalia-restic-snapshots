@@ -38,6 +38,7 @@ H.commands = {}
 H.pending = {}
 H.logs = {}
 H.files = {}
+H.missingPaths = {}  -- paths fileInfo reports as absent (drives the template's optional sources)
 H.fsCalls = {}       -- every filesystem call, in order (name + path/text)
 H.failCalls = {}     -- set e.g. H.failCalls.renameFile = true to simulate a failure
 H.mtimes = {}        -- [path] = epoch seconds (or ms); drives jobs.sweep tests
@@ -106,6 +107,7 @@ function H.install(plugin_dir)
   H.pending = {}
   H.logs = {}
   H.files = {}
+  H.missingPaths = {}
   H.fsCalls = {}
   H.failCalls = {}
   H.mtimes = {}
@@ -122,6 +124,9 @@ function H.install(plugin_dir)
     expandPath = function(path) return path end,
     fileExists = function(path) return path:match("/restic$") ~= nil or path:match("^/tmp") ~= nil end,
     fileInfo = function(path)
+      if H.missingPaths[path] == true then
+        return nil
+      end
       local contents = H.files[path]
       if contents ~= nil then
         return { size = #contents, mtime = H.mtimes[path] or 0, isDir = false }
