@@ -1,5 +1,44 @@
 # Changelog
 
+## 0.7.0 — 2026-09-26
+
+The template release. 0.6.x made a backup you could trust; this release removes the part where you
+had to remember which dotfiles to trust it with.
+
+### Added
+
+- **Backup templates: a named source set, selected with one setting.** `template` (`custom` by
+default) can be set to **CachyOS System Restore** — a curated list of the Hyprland, Noctalia, hyprfm,
+kitty, alacritty, btop, fish, uwsm, systemd user, autostart, satty, llama-swap and shell dotfiles a
+CachyOS desktop is made of — so a restore does not begin with hunting through `$HOME`. Two rules
+make it safe to leave on:
+
+  - `backup_paths` are **added** to the template, never replaced by it, so switching template cannot
+    silently drop a path the user typed.
+  - a template's paths are **optional**. A machine will not have `~/.config/hyprfm` or `~/.zshrc`,
+    and restic creates the snapshot but exits `3` when a source is missing, which the service would
+    have recorded as a failed run. The service now hands restic only the template paths that exist
+    and logs how many it dropped; a path typed under `custom` stays strict and still fails loudly.
+    If no source exists at all, the backup is refused with a reason.
+
+  Sources are `~`-expanded (restic runs from an argv with no shell, so a literal `~` was previously
+  passed through and reported missing) and de-duplicated, template-first. A template contributes
+  **paths only, never tags**: restic groups retention by host, paths and tags, so adding a tag
+  implicitly would split a repository's snapshots into separate retention groups.
+
+  The Run tab shows the active template, its path count and the resolved sources in a card whose
+  path line is width-bounded (`flexGrow` + `maxLines`) so a long list cannot run off the edge.
+
+### Notes
+
+- The template library (`lib/templates.luau`) is separate from `lib/restic.luau` so more templates
+  can be added as pure data. It is the one module the pure layer is allowed to `require`; the
+  no-I/O source test now states that exception explicitly instead of forbidding every `require`.
+- `tests/test_source_invariants.py` fails if a template exists in the library but is not offered in
+  `plugin.toml`, or is offered without a translation key, so the three files cannot drift.
+- End-to-end on a throwaway repository with a partial home: the template resolves to the existing
+  paths, restic exits **0**, and the snapshot records exactly those paths.
+
 ## 0.6.4 — 2026-09-20
 
 ### Fixed

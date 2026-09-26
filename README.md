@@ -137,6 +137,35 @@ over credentials embedded in the repository URL.
 Point the **restore target** at a directory you own that is *not* inside a backup source; restores
 and restore verification write there, never over a live file.
 
+## Backup templates
+
+Typing out every dotfile path is the tedious part of a desktop restore, so `template` names a
+curated source set instead:
+
+| Template | Captures |
+| --- | --- |
+| `custom` | Nothing preselected — `backup_paths` alone, exactly as before. |
+| `cachyos-system-restore` | Hyprland, Noctalia, hyprfm, kitty, alacritty, btop, fish, uwsm, systemd user units, autostart, satty, llama-swap, `mimeapps.list`, `~/.local/bin`, `~/.local/share/applications`, and the `.bashrc` / `.bash_profile` / `.zshrc` / `.gitconfig` files. |
+
+Two rules make a template safe to leave running on any machine:
+
+- **Your `backup_paths` are added to the template, never replaced by it.** Switching template — or
+  back to `custom` — cannot silently drop a path you typed.
+- **A template's paths are optional; yours are not.** A machine will not have every path a template
+  names (`~/.config/hyprfm`, `~/.zshrc`, …). restic creates a snapshot but exits `3` when a source is
+  missing, which the plugin records as a failed run — so the service hands restic only the template
+  paths that exist, and logs how many it skipped. A path you typed in `backup_paths` under `custom`
+  is passed through unchanged: a typo there fails loudly. If *no* source exists, the backup is
+  refused with a reason rather than run against nothing.
+
+A template contributes paths only. It deliberately does **not** add tags: restic groups retention by
+host, paths and tags, so silently adding one would split a repository's snapshots into separate
+retention groups. Credentials in dedicated locations (`~/.ssh`, `~/.gnupg`), caches and media are
+left out — but a secret stored *inside* a captured config directory (a token in
+`~/.config/noctalia/settings.toml`, say) is captured, so the repository is only as private as its
+password. The Run tab shows the active template and the sources it resolves to; a snapshot's own
+Details card lists the paths restic actually recorded.
+
 ## Usage
 
 | Entry | How to reach it |
@@ -493,7 +522,8 @@ settings page's advanced toggle.
 | `repository` | `string` | *(empty)* | Restic repository: a local path (`/mnt/backup/restic`) or a backend URL (`sftp:host:/srv/restic`, `s3:…`, `b2:…`, `rclone:…`). Anything before an `@` and any token query parameter is redacted before the value is shown in the panel or the widget tooltip. Nothing runs until this and `password_file` are set. |
 | `password_file` | `file` | *(empty)* | Path to a file holding the repository password. Passed to restic as `--password-file <path>`; the plugin stores the path only and never reads the file. `chmod 600` it yourself. |
 | `env_file` | `file` | *(empty)* | Optional file sourced by the job script (`set -a; . <path>; set +a`) before restic runs, for backends that take credentials from the environment (`AWS_ACCESS_KEY_ID`, `B2_ACCOUNT_KEY`, `RCLONE_*`). Must be readable by your user at job time. |
-| `backup_paths` | `string_list` | `[]` | Absolute paths to back up, each passed as a positional argument to `restic backup`. Nothing is backed up while this is empty. |
+| `template` | `select` | `custom` | A built-in source set, so a desktop restore does not start with hand-picking dotfiles. `custom` uses `backup_paths` alone; **CachyOS System Restore** adds the Hyprland, Noctalia, file manager, terminal, fish, systemd user, autostart and shell dotfiles. `backup_paths` are *added* to a template, never replaced by it. See [Backup templates](#backup-templates). |
+| `backup_paths` | `string_list` | `[]` | Paths to back up; a leading `~` is expanded. With `template = custom` these are the only sources; with a template they are additions. Nothing is backed up while the combined set is empty. |
 | `backup_tags` | `string_list` | `["noctalia"]` | Tags attached to every snapshot this plugin creates. Also what the panel's *tagged &lt;tag&gt;* filter matches. |
 | `exclude_file` | `file` | *(empty)* | Optional restic exclude file passed as `--exclude-file`. |
 | `mode` | `select` | `plugin` | `plugin` runs the plugin's own schedule; `observe` never starts a scheduled backup and only watches a repository something else writes to. Manual actions (back up now, check, restore, verify, forget) work in both modes. |
@@ -607,6 +637,15 @@ noctalia msg plugin carlocamacho/restic-snapshots:service all restore '{"snapsho
 
 Read this before you decide how much to trust the plugin with. Every item here is a real property of
 the current implementation, not a roadmap promise.
+
+- **A template is a curated subset, not a system image.** It captures config, not applications, and
+  it does not back up `$HOME` wholesale: credentials in dedicated locations (`~/.ssh`, `~/.gnupg`),
+  caches, downloads and media are excluded by construction. It restores *how the desktop is
+  configured*, not the packages those configs depend on — keep a package list (or an image)
+  alongside it. Paths a given machine does not have are skipped rather than failing the run, so a
+  green run proves the sources that exist were captured, not that every path in the template was
+  present. And a secret that lives *inside* a captured directory (a token in a config file) is
+  captured too: restic encrypts it, so the repository is only as private as its password.
 
 - **Verification is a sample, not a proof.** `verify_file_count` files (3 by default), from the
   newest snapshot only, at most 4 MiB each. It catches "the repository no longer restores", "the
