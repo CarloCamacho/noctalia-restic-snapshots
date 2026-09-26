@@ -12,7 +12,7 @@
 id           = "carlocamacho/restic-snapshots"
 name         = "Restic Snapshots"
 version      = "0.6.4"
-updated_at   = 1789480397
+updated_at   = 1789908482
 added_at     = 1789392236
 author       = "carlocamacho"
 license      = "MIT"
