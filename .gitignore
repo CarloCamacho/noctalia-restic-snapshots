@@ -6,3 +6,6 @@ __pycache__/
 venv/
 scratch/
 .tools-build/
+
+# Raw screen captures (kept locally for docs/thumbnails, not part of the plugin).
+screenshots/
